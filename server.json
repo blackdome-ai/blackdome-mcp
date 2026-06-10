@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.blackdome-ai/blackdome",
+  "title": "BlackDome Threat Intel",
+  "description": "Live honeypot threat intel: attacker IPs, IOCs, credentials, payloads, actors.",
+  "websiteUrl": "https://blackdome.ai",
+  "repository": {
+    "url": "https://github.com/blackdome-ai/blackdome-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "blackdome-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "BLACKDOME_API_KEY",
+          "description": "Optional Bearer API key. Free public tools work without it; paid tiers (credential intel, payloads, actors, warboard, STIX export) require a key. Get one at https://blackdome.ai/pricing",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "BLACKDOME_BASE_URL",
+          "description": "API base URL (default https://api.blackdome.ai).",
+          "isRequired": false,
+          "default": "https://api.blackdome.ai"
+        },
+        {
+          "name": "BLACKDOME_TIMEOUT",
+          "description": "HTTP request timeout in seconds (default 15). Increase for large STIX/CSV exports.",
+          "isRequired": false,
+          "default": "15"
+        }
+      ]
+    }
+  ]
+}
