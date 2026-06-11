@@ -100,8 +100,9 @@ def _format_error(exc: Exception) -> str:
             return (
                 "Access denied (403): your plan does not include the feature "
                 "this tool needs. credential search/stats require the Credential "
-                "Intelligence or Threat Intel Enterprise plan; STIX export "
-                "requires Pro or higher. Upgrade at https://blackdome.ai/pricing. "
+                "Intelligence or Threat Intel Enterprise plan; session intel "
+                "requires Enterprise/OEM; detonation intel and STIX export "
+                "require Pro or higher. Upgrade at https://blackdome.ai/pricing. "
                 f"Server said: {detail}"
             )
         if status == 429:
@@ -593,6 +594,164 @@ async def warboard(
 
 
 @mcp.tool()
+async def list_notable_sessions(
+    min_commands: int = 3,
+    since: Optional[str] = None,
+    service: Optional[str] = None,
+    technique: Optional[str] = None,
+    human_likely: Optional[bool] = None,
+    actor_id: Optional[str] = None,
+    limit: int = 100,
+) -> str:
+    """List rare hand-keyed attacker sessions ranked by score (paid: Enterprise session_intel).
+
+    Returns a flat object with count and sessions[]. Each session includes
+    session_id, actor_id, ip, geo, command_count, distinct_techniques,
+    primary_tactic, persona_stage, persona_score, score, first_ts, last_ts,
+    novelty, dropped_artifact_count, edge_id and human_likely. Use this to
+    surface the most interesting hands-on-keyboard intrusions out of botnet
+    probe noise. Requires the session_intel feature (Enterprise/OEM).
+
+    Args:
+        min_commands: Minimum command count (default 3)
+        since: ISO timestamp lower bound
+        service: Filter by service (e.g. "ssh")
+        technique: Filter by MITRE technique id (e.g. "T1059")
+        human_likely: Only return sessions matching the human-likely heuristic
+        actor_id: Filter by actor id
+        limit: Max sessions to return (default 100, capped at 100)
+    """
+    try:
+        payload = await _get(
+            "/api/v1/blackdome/intel/sessions",
+            {
+                "min_commands": min_commands,
+                "since": since,
+                "service": service,
+                "technique": technique,
+                "human_likely": human_likely,
+                "actor_id": actor_id,
+                "limit": min(limit, 100),
+            },
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+async def get_session_transcript(
+    session_id: str,
+    limit: int = 500,
+    offset: int = 0,
+) -> str:
+    """Get a structured attacker session transcript (paid: Enterprise session_intel).
+
+    Returns {session, steps, total_steps, truncated}. The session object includes
+    session_id, actor_id, ip, geo, edge_id, primary_tactic, start_ts, end_ts,
+    persona_stage, persona_score and dropped_artifacts. Each step includes seq,
+    ts, command, output_preview, exit_code, cwd, latency_ms, techniques and
+    guard_triggered. Requires the session_intel feature (Enterprise/OEM).
+
+    Args:
+        session_id: Session id returned by list_notable_sessions
+        limit: Max transcript steps to return (default 500, capped at 1000)
+        offset: Pagination offset
+    """
+    try:
+        payload = await _get(
+            f"/api/v1/blackdome/intel/sessions/{quote(session_id, safe='')}/transcript",
+            {
+                "limit": min(limit, 1000),
+                "offset": offset,
+            },
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+async def list_detonations(
+    verdict: Optional[str] = None,
+    vm_type: Optional[str] = None,
+    sha256: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 100,
+) -> str:
+    """List malware detonation reports with IOC counts and file classification (paid: Pro detonation_intel).
+
+    Returns a flat object with count and detonations[]. Each detonation includes
+    detonation_id, sha256, verdict, finished_at, vm_type, magika_label and
+    ioc_count. Requires the detonation_intel feature (Pro/Enterprise/OEM).
+
+    Args:
+        verdict: Filter by verdict (e.g. "malware", "benign", "suspicious")
+        vm_type: Filter by sandbox VM type
+        sha256: Filter by artifact sha256
+        since: ISO timestamp lower bound
+        limit: Max detonations to return (default 100, capped at 100)
+    """
+    try:
+        payload = await _get(
+            "/api/v1/blackdome/intel/detonations",
+            {
+                "verdict": verdict,
+                "vm_type": vm_type,
+                "sha256": sha256,
+                "since": since,
+                "limit": min(limit, 100),
+            },
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+async def get_detonation_report(detonation_id: str) -> str:
+    """Get a full malware detonation report (paid: Pro detonation_intel).
+
+    Returns detonation_id, sha256, verdict, started_at, finished_at, metadata,
+    report_available, report_unavailable_reason, report_body, iocs[] and
+    artifact classification fields. report_available=false is returned when a
+    report file is missing, absent or too large. Requires the detonation_intel
+    feature (Pro/Enterprise/OEM).
+
+    Args:
+        detonation_id: Detonation id returned by list_detonations
+    """
+    try:
+        payload = await _get(
+            f"/api/v1/blackdome/intel/detonations/{quote(detonation_id, safe='')}"
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+async def get_artifact(sha256: str) -> str:
+    """Get an artifact dossier with linked detonation, IOCs and session reference (paid: Pro detonation_intel).
+
+    Returns artifact classification fields, linked detonation summary, iocs[],
+    and dropped_by_session identifiers/counts only. It does not request or
+    return transcript command text or output_preview fields. Requires the
+    detonation_intel feature (Pro/Enterprise/OEM).
+
+    Args:
+        sha256: Artifact sha256 to inspect
+    """
+    try:
+        payload = await _get(
+            f"/api/v1/blackdome/intel/artifacts/{quote(sha256, safe='')}"
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
 async def whoami() -> str:
     """Check your BlackDome tenant identity, plan, features and live quota (any valid key).
 
@@ -625,7 +784,9 @@ def main():
             "credential_preview, verify_sigil, recent_iocs, ioc_trends, and "
             "json/csv export_iocs) will work, but paid tools "
             "(search_credentials, credential_stats, list_payloads, get_actor, "
-            "warboard, whoami, and stix export) will return 401. "
+            "warboard, list_notable_sessions, get_session_transcript, "
+            "list_detonations, get_detonation_report, get_artifact, whoami, "
+            "and stix export) will return 401. "
             "Get a key at https://blackdome.ai/pricing.",
             file=sys.stderr,
         )

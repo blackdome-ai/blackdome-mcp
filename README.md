@@ -80,9 +80,14 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `list_payloads` | **Pro** (`api_access`) | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
 | `get_actor` | **Pro** (`api_access`) | List clustered threat actors, or fetch one actor's sessions |
 | `warboard` | **Pro** (`api_access`) | Sigil leaderboard with intrusion narratives + attacker command tails |
+| `list_notable_sessions` | **Enterprise** (`session_intel`) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
+| `get_session_transcript` | **Enterprise** (`session_intel`) | Structured command/output transcript for one attacker session |
+| `list_detonations` | **Pro** (`detonation_intel`) | Malware detonation list with verdicts, Magika labels and IOC counts |
+| `get_detonation_report` | **Pro** (`detonation_intel`) | Full detonation report with behavior, IOCs, artifact classification and report availability |
+| `get_artifact` | **Pro** (`detonation_intel`) | Artifact dossier with linked detonation, IOCs and session identifiers only |
 | `whoami` | **Any key** | Check your tenant, plan, features and live quota |
 
-**Plans:** Community (free) → Pro ($299, adds `stix_export`, `api_access`) → Enterprise ($2000, adds `credential_intel`, `bulk_api`) → OEM ($5000). See [pricing](https://blackdome.ai/pricing).
+**Plans:** Community (free) → Pro ($299, adds `stix_export`, `api_access`, `detonation_intel`) → Enterprise ($2000, adds `credential_intel`, `bulk_api`, `session_intel`) → OEM ($5000). See [pricing](https://blackdome.ai/pricing).
 
 ## Example Prompts
 
@@ -96,6 +101,8 @@ Once connected, try asking your AI assistant:
 - *"Export the IOC feed as CSV so I can load it into my SIEM."*
 - *"What plan am I on and which features do I have?"* (runs `whoami`)
 - *"Search captured SSH credentials for the username root."* (paid)
+- *"Show me the most active hand-keyed attacker sessions this week."* (Enterprise)
+- *"Pull the detonation report for sha256 a6713518f2e26745683d33ded61b465d0645d7af850464c559fba8bb84e68398."* (Pro)
 
 ## Environment Variables
 

@@ -382,3 +382,145 @@ def test_headers_includes_bearer_when_key_set(monkeypatch):
     headers = server._headers()
     assert headers["Authorization"] == "Bearer bd_testkey"
     assert headers["Accept"] == "application/json"
+
+
+# ---------------------------------------------------------------------------
+# Paid intel tools
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_notable_sessions_builds_params_and_clamps_limit():
+    def handler(request):
+        return json_response({"sessions": [], "count": 0})
+
+    with mock_api(handler) as captured:
+        await server.list_notable_sessions(
+            min_commands=4,
+            since="2026-06-01T00:00:00Z",
+            service="ssh",
+            technique="T1059",
+            human_likely=True,
+            actor_id="actor-1",
+            limit=999,
+        )
+
+    url = captured[0].url
+    assert url.path == "/api/v1/blackdome/intel/sessions"
+    assert url.params["min_commands"] == "4"
+    assert url.params["since"] == "2026-06-01T00:00:00Z"
+    assert url.params["service"] == "ssh"
+    assert url.params["technique"] == "T1059"
+    assert url.params["human_likely"] == "true"
+    assert url.params["actor_id"] == "actor-1"
+    assert url.params["limit"] == "100"
+
+
+@pytest.mark.asyncio
+async def test_get_session_transcript_quotes_path_and_clamps_limit():
+    def handler(request):
+        return json_response(
+            {
+                "session": {"session_id": "sess/with space", "persona_stage": "Curious"},
+                "steps": [
+                    {
+                        "seq": 1,
+                        "command": "id",
+                        "output_preview": "uid=0",
+                        "exit_code": 0,
+                        "cwd": "/tmp",
+                        "techniques": ["T1059"],
+                    }
+                ],
+                "total_steps": 1,
+                "truncated": False,
+            }
+        )
+
+    with mock_api(handler) as captured:
+        await server.get_session_transcript("sess/with space", limit=5000, offset=7)
+
+    url = captured[0].url
+    assert (
+        url.raw_path.decode()
+        == "/api/v1/blackdome/intel/sessions/sess%2Fwith%20space/transcript?limit=1000&offset=7"
+    )
+    assert url.params["limit"] == "1000"
+    assert url.params["offset"] == "7"
+
+
+@pytest.mark.asyncio
+async def test_list_detonations_builds_params_and_clamps_limit():
+    def handler(request):
+        return json_response({"detonations": [], "count": 0})
+
+    with mock_api(handler) as captured:
+        await server.list_detonations(
+            verdict="malware",
+            vm_type="linux",
+            sha256="a" * 64,
+            since="2026-06-01T00:00:00Z",
+            limit=500,
+        )
+
+    url = captured[0].url
+    assert url.path == "/api/v1/blackdome/intel/detonations"
+    assert url.params["verdict"] == "malware"
+    assert url.params["vm_type"] == "linux"
+    assert url.params["sha256"] == "a" * 64
+    assert url.params["since"] == "2026-06-01T00:00:00Z"
+    assert url.params["limit"] == "100"
+
+
+@pytest.mark.asyncio
+async def test_get_detonation_report_quotes_path():
+    def handler(request):
+        return json_response(
+            {
+                "detonation_id": "det/with space",
+                "sha256": "b" * 64,
+                "verdict": "malware",
+                "report_available": True,
+                "report_body": {"behavior": []},
+            }
+        )
+
+    with mock_api(handler) as captured:
+        await server.get_detonation_report("det/with space")
+
+    assert (
+        captured[0].url.raw_path.decode()
+        == "/api/v1/blackdome/intel/detonations/det%2Fwith%20space"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_artifact_quotes_path_and_does_not_return_transcript_fields():
+    def handler(request):
+        assert "/transcript" not in request.url.path
+        return json_response(
+            {
+                "artifact": {
+                    "sha256": "c/with space",
+                    "magika_label": "ELF",
+                    "session_id": "sess-1",
+                    "actor_id": "actor-1",
+                },
+                "detonation": {"detonation_id": "det-1", "verdict": "malware"},
+                "iocs": [],
+                "dropped_by_session": {
+                    "session_id": "sess-1",
+                    "actor_id": "actor-1",
+                    "first_ts": "2026-06-01T00:00:00Z",
+                    "last_ts": "2026-06-01T00:01:00Z",
+                    "command_count": 4,
+                },
+            }
+        )
+
+    with mock_api(handler) as captured:
+        out = await server.get_artifact("c/with space")
+
+    assert captured[0].url.raw_path.decode() == "/api/v1/blackdome/intel/artifacts/c%2Fwith%20space"
+    assert '"command":' not in out
+    assert '"output_preview":' not in out
