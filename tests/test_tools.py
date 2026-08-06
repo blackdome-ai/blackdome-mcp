@@ -106,11 +106,11 @@ async def test_recent_iocs_uses_public_path():
         return json_response({"total": 0, "iocs": []})
 
     with mock_api(handler) as captured:
-        await server.recent_iocs(ioc_type="sha256", days=30, limit=3)
+        await server.recent_iocs(ioc_type="sha256", limit=3)
 
     url = captured[0].url
-    # MUST be the public /api/blackdome/iocs path, NOT threat-intel/iocs
-    assert url.path == "/api/blackdome/iocs"
+    # MUST be the redacted public preview, NOT the keyed /iocs feeds
+    assert url.path == "/api/blackdome/iocs/public"
     assert url.params["ioc_type"] == "sha256"
     assert url.params["limit"] == "3"
 
@@ -123,7 +123,7 @@ async def test_ioc_trends_path():
     with mock_api(handler) as captured:
         await server.ioc_trends(days=7)
 
-    assert captured[0].url.path == "/api/v1/blackdome/threat-intel/trends"
+    assert captured[0].url.path == "/api/blackdome/iocs/public/trends"
     assert captured[0].url.params["days"] == "7"
 
 

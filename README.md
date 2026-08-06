@@ -1,4 +1,4 @@
-<!-- mcp-name: io.github.blackdome-ai/blackdome -->
+<!-- mcp-name: io.github.blackdome-ai/blackdome-mcp -->
 
 # BlackDome MCP Server
 
@@ -72,7 +72,7 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `attack_heatmap` | **Free** | Country-aggregated attack heatmap with centroids (limit ≥ 5) |
 | `credential_preview` | **Free** | Sample of recent credentials (masked server-side) + teaser totals |
 | `verify_sigil` | **Free** | Verify a BlackDome Sigil / audit record by id |
-| `recent_iocs` | **Free** | Browse recent IOCs with full filter set (72h community delay) |
+| `recent_iocs` | **Free** | Browse recent redacted IOCs — type/severity filters (72h community delay, 25-row cap) |
 | `ioc_trends` | **Free** | Aggregated IOC trends — totals, breakdowns, daily new, top MITRE |
 | `export_iocs` | **Free** (json/csv) · **Pro** (stix) | Export the IOC feed; STIX bundle needs the `stix_export` feature |
 | `search_credentials` | **Enterprise** (`credential_intel`) | Search the global credential corpus with PLAINTEXT passwords |

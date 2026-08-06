@@ -295,48 +295,29 @@ async def verify_sigil(sigil_id: str) -> str:
 async def recent_iocs(
     ioc_type: Optional[str] = None,
     severity: Optional[str] = None,
-    verdict: Optional[str] = None,
-    min_confidence: Optional[int] = None,
-    mitre_technique: Optional[str] = None,
-    tag: Optional[str] = None,
-    search: Optional[str] = None,
-    days: int = 30,
     limit: int = 20,
-    offset: int = 0,
 ) -> str:
     """Browse recent indicators of compromise (IOCs) from the honeypot fleet (free).
 
-    Returns IOCs (sha256/ipv4/domain/url/...) with confidence, severity, verdict,
-    MITRE tactics/techniques, tags, sighting counts and metadata. The free
-    community surface applies a 72h freshness delay; the full filter set works
-    key-less.
+    Returns redacted IOCs (sha256/ipv4/domain/url/...) with confidence, severity,
+    verdict, MITRE tactics/techniques, tags, and sighting counts from the public
+    community preview. Values are redacted and the feed carries a 72h freshness
+    delay; up to 25 rows per request. Filters: ioc_type and severity only —
+    value search, verdict/confidence/MITRE filtering, and pagination require a
+    paid plan key (https://blackdome.ai/pricing).
 
     Args:
         ioc_type: Filter by IOC type (e.g. "sha256", "ipv4", "domain", "url")
         severity: Filter by severity (e.g. "high", "medium", "low")
-        verdict: Filter by verdict (e.g. "malicious", "suspicious")
-        min_confidence: Minimum confidence score (0-100)
-        mitre_technique: Filter by MITRE technique id (e.g. "T1105")
-        tag: Filter by tag (e.g. "honeypot_capture")
-        search: Free-text search over IOC values
-        days: Lookback period in days (default 30)
-        limit: Max IOCs to return (default 20)
-        offset: Pagination offset (default 0)
+        limit: Max IOCs to return (default 20, capped at 25)
     """
     try:
-        # NOTE: the PUBLIC path is /api/blackdome/iocs. Do NOT use
-        # /api/blackdome/threat-intel/iocs here — it is the keyed twin.
-        payload = await _get("/api/blackdome/iocs", {
+        # Public redacted preview. /api/blackdome/iocs is the KEYED customer
+        # feed; /api/blackdome/threat-intel/iocs is its external twin.
+        payload = await _get("/api/blackdome/iocs/public", {
             "ioc_type": ioc_type,
             "severity": severity,
-            "verdict": verdict,
-            "min_confidence": min_confidence,
-            "mitre_technique": mitre_technique,
-            "tag": tag,
-            "search": search,
-            "days": days,
             "limit": limit,
-            "offset": offset,
         })
         return json.dumps(payload, indent=2, default=str)
     except Exception as exc:
@@ -356,9 +337,9 @@ async def ioc_trends(days: int = 7) -> str:
         days: Lookback period in days (default 7, max 90 on this endpoint)
     """
     try:
-        # PUBLIC despite the /api/v1 base — mounted on the public router and
-        # only requires the 'ioc_browse' feature the free tenant already has.
-        payload = await _get("/api/v1/blackdome/threat-intel/trends", {
+        # Public aggregate trends (no indicator values), 72h community delay.
+        # /api/v1/blackdome/threat-intel/trends is the keyed customer twin.
+        payload = await _get("/api/blackdome/iocs/public/trends", {
             "days": days,
         })
         return json.dumps(payload, indent=2, default=str)
