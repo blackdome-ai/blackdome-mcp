@@ -15,6 +15,7 @@ Authenticates against the BlackDome API with a Bearer token when one is set.
 import json
 import os
 import sys
+from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -32,6 +33,22 @@ BASE_URL = os.environ.get(
     "BLACKDOME_BASE_URL", "https://api.blackdome.ai"
 ).rstrip("/")
 TIMEOUT = int(os.environ.get("BLACKDOME_TIMEOUT", "15"))
+
+# Hosted (streamable-HTTP) deployments serve many customers from one process:
+# each request's Authorization/X-API-Key header is captured into this var by
+# the ASGI middleware in blackdome_mcp.http_server and takes precedence over
+# the process-wide BLACKDOME_API_KEY env var. Stdio mode never sets it.
+_REQUEST_API_KEY: ContextVar[str] = ContextVar("blackdome_mcp_request_api_key", default="")
+
+
+def set_request_api_key(key: str) -> Any:
+    """Set the per-request API key (hosted mode). Returns a reset token."""
+    return _REQUEST_API_KEY.set(key or "")
+
+
+def current_api_key() -> str:
+    """Per-request key (hosted mode) falling back to the env-var key (stdio)."""
+    return _REQUEST_API_KEY.get() or API_KEY
 
 mcp = FastMCP(
     "BlackDome",
@@ -57,11 +74,13 @@ def _headers() -> dict[str, str]:
 
     Always advertises JSON. Adds a Bearer Authorization header ONLY when an API
     key is configured — the public/community tools must work key-less, so we
-    never send an empty/blank Authorization header.
+    never send an empty/blank Authorization header. In hosted mode the key is
+    per-request (contextvar); in stdio mode it is the env var.
     """
     headers = {"Accept": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    key = current_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     return headers
 
 

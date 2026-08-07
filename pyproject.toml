@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blackdome-mcp"
-version = "0.2.2"
+version = "0.3.0"
 description = "BlackDome MCP Server — AI agent access to live honeypot threat intelligence, attacker IPs, IOCs, and credential intel."
 readme = "README.md"
 license = "MIT"
@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "mcp[cli]>=1.0.0",
     "httpx>=0.27.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,7 @@ test = [
 
 [project.scripts]
 blackdome-mcp = "blackdome_mcp.server:main"
+blackdome-mcp-http = "blackdome_mcp.http_server:main"
 
 [project.urls]
 Homepage = "https://blackdome.ai"
