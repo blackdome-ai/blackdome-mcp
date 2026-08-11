@@ -8,27 +8,53 @@ Most tools are **free and need no API key** (the public community tier). A subse
 
 ## Quick Start
 
-### Install
+### Option 1 — Cloud MCP (recommended, no install)
 
-```bash
-pip install blackdome-mcp
+One URL, works in every client that supports remote MCP (Claude Desktop, the claude.ai web app, mobile, Cursor):
+
+```
+https://api.blackdome.ai/mcp
 ```
 
-### Configure
+Free tools work with no key. To unlock the paid tiers (credential intelligence, payloads, actors, warboard, STIX export), get an API key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)** and add it as an `Authorization` header:
 
-The free public tools work with **no API key**. To unlock the paid tiers (credential intelligence, payloads, actors, warboard, STIX export), get an API key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)**.
+```json
+{
+  "mcpServers": {
+    "blackdome-cloud": {
+      "url": "https://api.blackdome.ai/mcp",
+      "headers": {
+        "Authorization": "Bearer bd_your_key_here"
+      }
+    }
+  }
+}
+```
+
+### Option 2 — Run it locally
+
+Use `uvx` (part of [uv](https://docs.astral.sh/uv/)) — it fetches and runs the server on demand, with no separate install step and no PATH issues:
+
+```bash
+uvx blackdome-mcp
+```
+
+Prefer a fixed install? `pip install blackdome-mcp` works too — but note the troubleshooting item at the bottom if your client says "command not found".
+
+The free public tools work with **no API key**. To unlock the paid tiers, get a key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)**.
 
 #### Claude Desktop
 
-Add to your `claude_desktop_config.json`:
+Merge this into `claude_desktop_config.json` — `~/Library/Application Support/Claude/` on macOS, `%APPDATA%\Claude\` on Windows — then restart Claude:
 
 ```json
 {
   "mcpServers": {
     "blackdome": {
-      "command": "blackdome-mcp",
+      "command": "uvx",
+      "args": ["blackdome-mcp"],
       "env": {
-        "BLACKDOME_API_KEY": "your-api-key-here"
+        "BLACKDOME_API_KEY": "bd_your_key_here"
       }
     }
   }
@@ -39,26 +65,42 @@ Add to your `claude_desktop_config.json`:
 
 #### Claude Code
 
+One command — the key is stored in the MCP config, so there are no shell exports to maintain (a plain `export BLACKDOME_API_KEY=...` only lasts for that terminal session, and your paid tools would stop working in the next one):
+
 ```bash
-claude mcp add blackdome -- blackdome-mcp
-# Optional — only needed for paid tools:
-export BLACKDOME_API_KEY="your-api-key-here"
+claude mcp add blackdome -e BLACKDOME_API_KEY=bd_your_key_here -- uvx blackdome-mcp
+```
+
+For free tools only:
+
+```bash
+claude mcp add blackdome -- uvx blackdome-mcp
 ```
 
 #### Cursor
 
-Add to your MCP settings:
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per project):
 
 ```json
 {
   "blackdome": {
-    "command": "blackdome-mcp",
+    "command": "uvx",
+    "args": ["blackdome-mcp"],
     "env": {
-      "BLACKDOME_API_KEY": "your-api-key-here"
+      "BLACKDOME_API_KEY": "bd_your_key_here"
     }
   }
 }
 ```
+
+## API Key Behavior
+
+- **No key:** free community tools work; paid tools return an explicit `401`.
+- **Invalid key:** paid tools (and `whoami`) fail loudly with `401 Invalid API key` — there is **no silent fallback** to free-tier results. Free tools keep working regardless of key validity.
+- **Expired key / cancelled plan:** `403 API key has expired` / `403 Tenant account is inactive` — again explicit errors, not degraded data.
+- **Valid key, wrong plan:** a tool whose feature your plan does not include returns an explicit `403`; check your granted features any time with `whoami`.
+
+If a paid tool returns less than expected, run `whoami` first — it reports your plan, features, and live quota.
 
 ## Available Tools
 
@@ -87,7 +129,7 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `get_artifact` | **Pro** (`detonation_intel`) | Artifact dossier with linked detonation, IOCs and session identifiers only |
 | `whoami` | **Any key** | Check your tenant, plan, features and live quota |
 
-**Plans:** Community (free) → Pro ($299, adds `stix_export`, `api_access`, `detonation_intel`) → Enterprise ($2000, adds `credential_intel`, `bulk_api`, `session_intel`) → OEM ($5000). See [pricing](https://blackdome.ai/pricing).
+**Plans:** Community (free) → Analyst ($49, real-time intel) → Pro ($299, adds `stix_export`, `api_access`, `detonation_intel`) → Enterprise ($2000, adds `credential_intel`, `bulk_api`, `session_intel`) → OEM ($5000). See [pricing](https://blackdome.ai/pricing).
 
 ## Example Prompts
 
@@ -106,6 +148,8 @@ Once connected, try asking your AI assistant:
 
 ## Environment Variables
 
+Local (stdio) server only — the cloud endpoint takes the key as an `Authorization: Bearer` header instead.
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BLACKDOME_API_KEY` | No | — | Bearer API key. Free tools work without it; paid tools require it |
@@ -115,6 +159,11 @@ Once connected, try asking your AI assistant:
 ## Rate Limits
 
 The free community tier is capped at roughly **30 requests/minute** and **100 requests/day**, and community IOC data carries a **72-hour freshness delay**. Paid plans raise these limits substantially (Enterprise: 1000 req/min, 50,000 req/day). When you hit a limit the server returns a clear `429` error with retry timing. Use `whoami` to see your live quota.
+
+## Troubleshooting
+
+- **"command not found" in a GUI client:** GUI apps don't load your shell PATH. Easiest fix: use `"command": "uvx", "args": ["blackdome-mcp"]` as shown above. If you pip-installed instead, run `which blackdome-mcp` (macOS/Linux) or `where blackdome-mcp` (Windows) and paste the full path into the `command` field.
+- **Paid tools return 401/403:** see [API Key Behavior](#api-key-behavior) — errors are explicit, and `whoami` tells you exactly what your key grants.
 
 ## Security
 
