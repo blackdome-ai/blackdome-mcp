@@ -1,6 +1,7 @@
 """Release tests must run the artifact, never ambient source or credentials."""
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -20,3 +21,9 @@ def test_artifact_environment_excludes_source_injection_and_unrelated_secrets(mo
     result = load_gate()._safe_environment()
     assert result["PATH"] == "/test/bin"
     assert "release-test-secret-or-source" not in result.values()
+
+
+def test_registry_description_fits_the_registry_validation_contract():
+    # Registry /validate rejected the original manifest with description >100.
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "server.json").read_text())
+    assert 1 <= len(manifest["description"]) <= 100
