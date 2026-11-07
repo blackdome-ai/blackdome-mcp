@@ -1,0 +1,37 @@
+name: Test Release Package
+
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tooling and build distributions
+        run: |
+          python -m pip install uv
+          uv sync --locked --extra test
+          uv build
+          uv venv --python python /tmp/blackdome-wheel
+          uv pip install --python /tmp/blackdome-wheel/bin/python dist/*.whl
+      - name: Test built artifacts and all 26 tools over stdio
+        env:
+          BLACKDOME_API_KEY: ""
+          BLACKDOME_TEST_PYTHON: /tmp/blackdome-wheel/bin/python
+          BLACKDOME_RUN_RELEASE_ARTIFACT_GATE: "1"
+          BLACKDOME_RUN_MCP_FLOOR_SMOKE: "1"
+        run: uv run --locked --extra test pytest -q

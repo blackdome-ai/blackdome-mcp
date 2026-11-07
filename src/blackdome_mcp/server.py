@@ -4,23 +4,27 @@ Gives AI agents direct access to live honeypot threat intelligence — attacker
 IPs, captured credentials, indicators of compromise (IOCs), malware payloads,
 threat actors, and a global attack map sourced from the BlackDome edge fleet.
 
-Most tools are FREE and work with NO API key (the public community tier).
-A subset of high-value intelligence (credential search, payloads, actors,
+Community tools are FREE and work with NO API key.
+Additional intelligence (credential search, payloads, actors,
 warboard, STIX export) requires an API key tied to a paid plan. Get a key at
 https://blackdome.ai/pricing.
 
 Authenticates against the BlackDome API with a Bearer token when one is set.
 """
 
+import ipaddress
 import json
 import os
+import re
 import sys
 from contextvars import ContextVar
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+
+from blackdome_mcp import __version__
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -63,6 +67,9 @@ mcp = FastMCP(
         "masked; the paid credential tools return the full intelligence."
     ),
 )
+# FastMCP 1.x does not expose a product-version constructor argument; its
+# protocol server reads this value into initialize.serverInfo.version.
+mcp._mcp_server.version = __version__
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -101,6 +108,16 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
         return resp.json()
 
 
+async def _post(path: str, body: dict[str, Any]) -> Any:
+    """Make a read-only JSON-body request to the BlackDome API."""
+    headers = _headers()
+    headers["Content-Type"] = "application/json"
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(f"{BASE_URL}{path}", headers=headers, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _format_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -119,8 +136,8 @@ def _format_error(exc: Exception) -> str:
             return (
                 "Access denied (403): your plan does not include the feature "
                 "this tool needs. credential search/stats require the Credential "
-                "Intelligence or Threat Intel Enterprise plan; session intel "
-                "requires Enterprise/OEM; detonation intel and STIX export "
+                "Intelligence plan or a candidate Enterprise/OEM pilot; session intel "
+                "requires a candidate Enterprise/OEM pilot; detonation intel and STIX export "
                 "require Pro or higher. Upgrade at https://blackdome.ai/pricing. "
                 f"Server said: {detail}"
             )
@@ -133,6 +150,120 @@ def _format_error(exc: Exception) -> str:
             )
         return f"API error {status}: {detail}"
     return f"Request failed: {exc}"
+
+
+class _CustomerIntelligenceValidationError(ValueError):
+    """Raised for invalid local customer-intelligence tool input."""
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]{2,63}$",
+    re.IGNORECASE,
+)
+_MAX_INDICATOR_LENGTH = 2048
+_CLUSTER_MAX_NODES = 100
+_CLUSTER_MAX_EDGES = 200
+_CLUSTER_MAX_EVIDENCE = 100
+_THREATDROP_MCP_DETONATION_LIMIT = 10
+_THREATDROP_MCP_ATTACHMENT_LIMIT = 10
+_THREATDROP_MCP_TIMELINE_LIMIT = 20
+_THREATDROP_MCP_TEXT_LIMIT = 256
+
+
+def _validation_error() -> str:
+    return "Invalid request parameters."
+
+
+def _has_unsafe_text(value: str) -> bool:
+    return (
+        not value
+        or len(value) > _MAX_INDICATOR_LENGTH
+        or value != value.strip()
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _validate_sha256(value: object) -> str:
+    if type(value) is not str or not _SHA256_RE.fullmatch(value):
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _validate_ip(value: object) -> str:
+    if type(value) is not str or _has_unsafe_text(value):
+        raise _CustomerIntelligenceValidationError
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise _CustomerIntelligenceValidationError from exc
+    return value
+
+
+def _validate_domain(value: object) -> str:
+    if type(value) is not str or _has_unsafe_text(value) or not _DOMAIN_RE.fullmatch(value):
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _validate_url(value: object) -> str:
+    if type(value) is not str or _has_unsafe_text(value):
+        raise _CustomerIntelligenceValidationError
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise _CustomerIntelligenceValidationError
+        if parsed.username is not None or parsed.password is not None:
+            raise _CustomerIntelligenceValidationError
+        _ = parsed.port
+        host = parsed.hostname
+        try:
+            _validate_ip(host)
+        except _CustomerIntelligenceValidationError:
+            _validate_domain(host)
+    except (ValueError, _CustomerIntelligenceValidationError) as exc:
+        raise _CustomerIntelligenceValidationError from exc
+    return value
+
+
+def _validate_selector(kind: object, value: object) -> tuple[str, str]:
+    if type(kind) is not str:
+        raise _CustomerIntelligenceValidationError
+    validators = {
+        "sha256": _validate_sha256,
+        "ip": _validate_ip,
+        "domain": _validate_domain,
+        "url": _validate_url,
+    }
+    validator = validators.get(kind)
+    if validator is None:
+        raise _CustomerIntelligenceValidationError
+    return kind, validator(value)
+
+
+def _validate_positive_int(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _validate_submission_id(value: object) -> int:
+    return _validate_positive_int(value)
+
+
+def _format_customer_intelligence_error(exc: Exception) -> str:
+    """Return an explicit but selector-safe customer intelligence error."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 401:
+            return "Authentication failed (401): bad or missing API key."
+        if status == 403:
+            return "Access denied (403): your plan does not include this feature."
+        if status == 429:
+            retry = exc.response.headers.get("Retry-After", "?")
+            return f"Rate limited (429). Retry after {retry} seconds."
+        return f"Customer intelligence request unavailable ({status})."
+    return "Customer intelligence request unavailable."
 
 
 # Password-like keys redacted from keyless tool output (defense-in-depth: catches
@@ -443,7 +574,7 @@ async def search_credentials(
     Returns credential records (username, password_hash, password_plain,
     protocol, source_ip, edge, session, first/last seen, attempt counts) from
     the shared global dataset. Requires the credential_intel feature
-    (Enterprise/OEM or the standalone Credential Intelligence plan). Plaintext
+    (a candidate Enterprise/OEM pilot or the standalone Credential Intelligence plan). Plaintext
     is intentionally returned here — it is NOT masked.
 
     Args:
@@ -483,7 +614,7 @@ async def credential_stats(
 
     Returns totals (unique credentials/ips/usernames), cross-protocol counts and
     top usernames/passwords from the shared global dataset. Requires the
-    credential_intel feature (Enterprise/OEM or the Credential Intelligence plan).
+    credential_intel feature (a candidate Enterprise/OEM pilot or the Credential Intelligence plan).
 
     Args:
         since: ISO timestamp lower bound
@@ -603,14 +734,14 @@ async def list_notable_sessions(
     actor_id: Optional[str] = None,
     limit: int = 100,
 ) -> str:
-    """List rare hand-keyed attacker sessions ranked by score (paid: Enterprise session_intel).
+    """List rare hand-keyed attacker sessions ranked by score (candidate Enterprise/OEM pilot session_intel).
 
     Returns a flat object with count and sessions[]. Each session includes
     session_id, actor_id, ip, geo, command_count, distinct_techniques,
     primary_tactic, persona_stage, persona_score, score, first_ts, last_ts,
     novelty, dropped_artifact_count, edge_id and human_likely. Use this to
     surface the most interesting hands-on-keyboard intrusions out of botnet
-    probe noise. Requires the session_intel feature (Enterprise/OEM).
+    probe noise. Requires the session_intel feature through a candidate Enterprise/OEM pilot.
 
     Args:
         min_commands: Minimum command count (default 3)
@@ -645,13 +776,13 @@ async def get_session_transcript(
     limit: int = 500,
     offset: int = 0,
 ) -> str:
-    """Get a structured attacker session transcript (paid: Enterprise session_intel).
+    """Get a structured attacker session transcript (candidate Enterprise/OEM pilot session_intel).
 
     Returns {session, steps, total_steps, truncated}. The session object includes
     session_id, actor_id, ip, geo, edge_id, primary_tactic, start_ts, end_ts,
     persona_stage, persona_score and dropped_artifacts. Each step includes seq,
     ts, command, output_preview, exit_code, cwd, latency_ms, techniques and
-    guard_triggered. Requires the session_intel feature (Enterprise/OEM).
+    guard_triggered. Requires the session_intel feature through a candidate Enterprise/OEM pilot.
 
     Args:
         session_id: Session id returned by list_notable_sessions
@@ -683,7 +814,7 @@ async def list_detonations(
 
     Returns a flat object with count and detonations[]. Each detonation includes
     detonation_id, sha256, verdict, finished_at, vm_type, magika_label and
-    ioc_count. Requires the detonation_intel feature (Pro/Enterprise/OEM).
+    ioc_count. Requires the detonation_intel feature through Pro or a candidate Enterprise/OEM pilot.
 
     Args:
         verdict: Filter by verdict (e.g. "malware", "benign", "suspicious")
@@ -716,7 +847,7 @@ async def get_detonation_report(detonation_id: str) -> str:
     report_available, report_unavailable_reason, report_body, iocs[] and
     artifact classification fields. report_available=false is returned when a
     report file is missing, absent or too large. Requires the detonation_intel
-    feature (Pro/Enterprise/OEM).
+    feature through Pro or a candidate Enterprise/OEM pilot.
 
     Args:
         detonation_id: Detonation id returned by list_detonations
@@ -737,7 +868,7 @@ async def get_artifact(sha256: str) -> str:
     Returns artifact classification fields, linked detonation summary, iocs[],
     and dropped_by_session identifiers/counts only. It does not request or
     return transcript command text or output_preview fields. Requires the
-    detonation_intel feature (Pro/Enterprise/OEM).
+    detonation_intel feature through Pro or a candidate Enterprise/OEM pilot.
 
     Args:
         sha256: Artifact sha256 to inspect
@@ -766,6 +897,412 @@ async def whoami() -> str:
         return json.dumps(payload, indent=2, default=str)
     except Exception as exc:
         return _format_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Customer Intelligence tools (keyed, read-only)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def explain_ioc(indicator_type: str, indicator_value: str) -> str:
+    """Explain observed evidence for an IP, domain, or URL (Analyst: ioc_explanation)."""
+    try:
+        if indicator_type not in {"ip", "domain", "url"}:
+            raise _CustomerIntelligenceValidationError
+        validators = {"ip": _validate_ip, "domain": _validate_domain, "url": _validate_url}
+        value = validators[indicator_type](indicator_value)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/ioc/explain",
+            {"indicator_type": indicator_type, "value": value},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
+
+
+@mcp.tool()
+async def compare_samples(left_sha256: str, right_sha256: str) -> str:
+    """Compare two samples deterministically (Pro: sample_compare)."""
+    try:
+        left, right = _validate_sha256(left_sha256), _validate_sha256(right_sha256)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/samples/compare",
+            {"left_sha256": left, "right_sha256": right},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
+
+
+@mcp.tool()
+async def get_evidence_cluster(
+    entity_kind: str,
+    value: str,
+    depth: int = 1,
+    max_nodes: int = 25,
+    max_edges: int = 50,
+    max_evidence: int = 50,
+) -> str:
+    """Get a bounded evidence cluster (Pro: genome_clusters)."""
+    try:
+        entity_kind, value = _validate_selector(entity_kind, value)
+        depth = _validate_positive_int(depth)
+        if depth not in {1, 2}:
+            raise _CustomerIntelligenceValidationError
+        max_nodes = min(_validate_positive_int(max_nodes), _CLUSTER_MAX_NODES)
+        max_edges = min(_validate_positive_int(max_edges), _CLUSTER_MAX_EDGES)
+        max_evidence = min(_validate_positive_int(max_evidence), _CLUSTER_MAX_EVIDENCE)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/genome/cluster",
+            {
+                "entity_kind": entity_kind,
+                "value": value,
+                "depth": depth,
+                "max_nodes": max_nodes,
+                "max_edges": max_edges,
+                "max_evidence": max_evidence,
+            },
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
+
+
+@mcp.tool()
+async def get_reproducible_novelty(entity_kind: str, value: str) -> str:
+    """Get a reproducible novelty assessment (Pro: reproducible_novelty)."""
+    try:
+        entity_kind, value = _validate_selector(entity_kind, value)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/genome/novelty",
+            {"entity_kind": entity_kind, "value": value},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
+
+
+@mcp.tool()
+async def get_threatdrop_case(submission_id: int) -> str:
+    """Get an account-bound sanitized ThreatDrop case (ThreatDrop API access)."""
+    try:
+        submission_id = _validate_submission_id(submission_id)
+        payload = await _get(
+            f"/api/v1/blackdome/threatdrop/submissions/{submission_id}/mcp-summary"
+        )
+        return json.dumps(_threatdrop_mcp_summary_subset(payload), indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
+
+
+_TAKEDOWN_SUBMISSION_SCALAR_TYPES = {
+    "id": (int,),
+    "message_id": (str, type(None)),
+    "received_at": (str, type(None)),
+}
+_TAKEDOWN_CASE_STATE_SCALAR_TYPES = {
+    "verdict": (str,),
+    "confidence": (int,),
+    "risk_score": (int,),
+    "threat_level": (str, type(None)),
+    "detonation_status": (str,),
+    "analysis_complete": (bool,),
+    "quarantined": (bool,),
+}
+
+
+def _typed_takedown_fields(source: dict[str, Any], schema: dict[str, tuple[type, ...]]) -> dict[str, Any]:
+    """Copy only approved scalar leaves with their exact public types."""
+    return {
+        key: source[key]
+        for key, allowed_types in schema.items()
+        if key in source and type(source[key]) in allowed_types
+    }
+
+
+def _takedown_status_subset(payload: Any) -> dict[str, Any]:
+    # The dedicated endpoint is bounded server-side. Keep this local projection
+    # as a defence-in-depth contract in case a proxy or older server returns an
+    # unexpected field.
+    if type(payload) is dict and type(payload.get("submission")) is dict:
+        return _threatdrop_mcp_summary_subset(payload)
+    if type(payload) is not dict:
+        return {"submission": {}, "case_state": {}, "counts": {}, "takedown_progress": {}}
+
+    raw_counts = payload.get("counts")
+    counts = {
+        key: raw_counts[key]
+        for key in (
+            "urls_extracted",
+            "urls_detonated",
+            "abuse_reports_sent",
+            "phone_reports_sent",
+        )
+        if type(raw_counts) is dict and type(raw_counts.get(key)) is int
+    }
+
+    raw_progress = payload.get("takedown_progress")
+    progress: dict[str, Any] = {}
+    if type(raw_progress) is dict:
+        for key in ("status", "reason", "sent_at"):
+            if raw_progress.get(key) is None or type(raw_progress.get(key)) is str:
+                if key in raw_progress:
+                    progress[key] = raw_progress[key]
+        for key in ("reports_total", "reports_sent"):
+            if raw_progress.get(key) is None or type(raw_progress.get(key)) is int:
+                if key in raw_progress:
+                    progress[key] = raw_progress[key]
+
+        raw_reply = raw_progress.get("provider_reply")
+        if type(raw_reply) is dict:
+            provider_reply = {
+                key: raw_reply[key]
+                for key in ("state", "last_at")
+                if key in raw_reply and (raw_reply[key] is None or type(raw_reply[key]) is str)
+            }
+            if "count" in raw_reply and (raw_reply["count"] is None or type(raw_reply["count"]) is int):
+                provider_reply["count"] = raw_reply["count"]
+            progress["provider_reply"] = provider_reply
+
+        raw_outcome = raw_progress.get("outcome")
+        if type(raw_outcome) is dict:
+            progress["outcome"] = {
+                key: raw_outcome[key]
+                for key in ("state", "evidence_level", "decided_at", "last_checked_at")
+                if key in raw_outcome and (raw_outcome[key] is None or type(raw_outcome[key]) is str)
+            }
+
+        raw_timeline = raw_progress.get("timeline")
+        if type(raw_timeline) is list:
+            timeline = []
+            for raw_item in raw_timeline:
+                if type(raw_item) is not dict:
+                    continue
+                if not all(type(raw_item.get(key)) is str for key in ("event", "occurred_at", "summary")):
+                    continue
+                item = {key: raw_item[key] for key in ("event", "occurred_at", "summary")}
+                for key in ("state", "provider"):
+                    if type(raw_item.get(key)) is str:
+                        item[key] = raw_item[key]
+                timeline.append(item)
+            progress["timeline"] = timeline
+
+    return {
+        "submission": _typed_takedown_fields(payload, _TAKEDOWN_SUBMISSION_SCALAR_TYPES),
+        "case_state": _typed_takedown_fields(payload, _TAKEDOWN_CASE_STATE_SCALAR_TYPES),
+        "counts": counts,
+        "takedown_progress": progress,
+    }
+
+
+_THREATDROP_MCP_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_THREATDROP_MCP_ID_RE = re.compile(r"^[a-z0-9-]{1,128}$")
+_THREATDROP_MCP_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+_THREATDROP_MCP_CONTENT_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+
+
+def _safe_summary_string(key: str, value: str) -> str | None:
+    if len(value) > _THREATDROP_MCP_TEXT_LIMIT:
+        return None
+    if key in {
+        "received_at", "started_at", "finished_at", "sent_at", "last_at",
+        "decided_at", "last_checked_at", "occurred_at",
+    }:
+        return value if _THREATDROP_MCP_TIMESTAMP_RE.fullmatch(value) else None
+    if key == "detonation_id":
+        return value if _THREATDROP_MCP_ID_RE.fullmatch(value) else None
+    if key == "content_type":
+        return value if _THREATDROP_MCP_CONTENT_TYPE_RE.fullmatch(value) else None
+    if key in {
+        "verdict", "threat_level", "detonation_status", "scan_result", "status",
+        "state", "evidence_level", "event",
+    }:
+        return value if _THREATDROP_MCP_TOKEN_RE.fullmatch(value) else None
+    return None
+
+
+def _summary_scalar_subset(source: Any, schema: dict[str, tuple[type, ...]]) -> dict[str, Any]:
+    if type(source) is not dict:
+        return {}
+    result: dict[str, Any] = {}
+    for key, allowed_types in schema.items():
+        value = source.get(key)
+        if type(value) in allowed_types:
+            if type(value) is str:
+                safe_value = _safe_summary_string(key, value)
+                if safe_value is not None:
+                    result[key] = safe_value
+            else:
+                result[key] = value
+    return result
+
+
+def _bounded_collection(
+    source: Any,
+    *,
+    schema: dict[str, tuple[type, ...]],
+    limit: int,
+    sort_key: Any,
+    required_strings: tuple[str, ...] = (),
+    reverse: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw_items = source if type(source) is list else []
+    items = []
+    for raw_item in raw_items:
+        if type(raw_item) is not dict:
+            continue
+        if any(type(raw_item.get(key)) is not str for key in required_strings):
+            continue
+        item = _summary_scalar_subset(raw_item, schema)
+        if any(key not in item for key in required_strings):
+            continue
+        items.append(item)
+    items.sort(key=sort_key, reverse=reverse)
+    returned = items[:limit]
+    return returned, {
+        "returned": len(returned),
+        "total": len(raw_items),
+        "truncated": len(raw_items) > len(returned),
+    }
+
+
+def _upstream_collection_meta(payload: dict[str, Any], key: str, observed: int, returned: int) -> dict[str, Any]:
+    """Keep an API-supplied exact total only when it cannot weaken local bounds."""
+    raw_meta = payload.get("collection_meta")
+    candidate = raw_meta.get(key) if type(raw_meta) is dict else None
+    total = candidate.get("total") if type(candidate) is dict else None
+    if type(total) is not int or total < observed:
+        total = observed
+    return {"returned": returned, "total": total, "truncated": total > returned}
+
+
+def _threatdrop_mcp_summary_subset(payload: Any) -> dict[str, Any]:
+    """Enforce the fixed, capped document-free ThreatDrop MCP response shape."""
+    if type(payload) is not dict:
+        payload = {}
+    submission = _summary_scalar_subset(
+        payload.get("submission"),
+        {"id": (int,), "received_at": (str, type(None))},
+    )
+    case_state = _summary_scalar_subset(
+        payload.get("case_state"),
+        {
+            "verdict": (str,), "confidence": (int,), "risk_score": (int,),
+            "threat_level": (str, type(None)), "detonation_status": (str,),
+            "analysis_complete": (bool,), "quarantined": (bool,),
+        },
+    )
+    counts = _summary_scalar_subset(
+        payload.get("counts"),
+        {
+            "urls_extracted": (int,), "urls_detonated": (int,),
+            "abuse_reports_sent": (int,), "phone_reports_sent": (int,),
+        },
+    )
+    detonations, detonations_meta = _bounded_collection(
+        payload.get("detonations"),
+        schema={
+            "detonation_id": (str,), "started_at": (str, type(None)),
+            "finished_at": (str, type(None)), "verdict": (str, type(None)),
+            "risk_score": (int, type(None)), "quarantined": (bool,),
+        },
+        limit=_THREATDROP_MCP_DETONATION_LIMIT,
+        sort_key=lambda item: (
+            str(item.get("started_at") or ""), str(item.get("detonation_id") or ""),
+        ),
+        required_strings=("detonation_id",),
+        reverse=True,
+    )
+    attachments, attachments_meta = _bounded_collection(
+        payload.get("attachments"),
+        schema={
+            "attachment_id": (int,), "content_type": (str, type(None)),
+            "size_bytes": (int, type(None)), "scan_result": (str, type(None)),
+            "verdict": (str, type(None)), "risk_score": (int, type(None)),
+        },
+        limit=_THREATDROP_MCP_ATTACHMENT_LIMIT,
+        sort_key=lambda item: int(item.get("attachment_id") or -1),
+    )
+    raw_progress = payload.get("takedown_progress")
+    raw_progress = raw_progress if type(raw_progress) is dict else {}
+    progress = _summary_scalar_subset(
+        raw_progress,
+        {
+            "status": (str, type(None)),
+            "sent_at": (str, type(None)), "reports_total": (int, type(None)),
+            "reports_sent": (int, type(None)),
+        },
+    )
+    provider_reply = _summary_scalar_subset(
+        raw_progress.get("provider_reply"),
+        {"state": (str, type(None)), "count": (int, type(None)), "last_at": (str, type(None))},
+    )
+    if provider_reply:
+        progress["provider_reply"] = provider_reply
+    outcome = _summary_scalar_subset(
+        raw_progress.get("outcome"),
+        {
+            "state": (str, type(None)), "evidence_level": (str, type(None)),
+            "decided_at": (str, type(None)), "last_checked_at": (str, type(None)),
+        },
+    )
+    if outcome:
+        progress["outcome"] = outcome
+    timeline, timeline_meta = _bounded_collection(
+        raw_progress.get("timeline"),
+        schema={
+            "event": (str,), "occurred_at": (str,), "state": (str,),
+        },
+        limit=_THREATDROP_MCP_TIMELINE_LIMIT,
+        sort_key=lambda item: (item["occurred_at"], item["event"]),
+        required_strings=("event", "occurred_at"),
+    )
+    progress["timeline"] = timeline
+    return {
+        "submission": submission,
+        "case_state": case_state,
+        "counts": counts,
+        "detonations": detonations,
+        "attachments": attachments,
+        "takedown_progress": progress,
+        "collection_meta": {
+            "detonations": _upstream_collection_meta(
+                payload, "detonations", detonations_meta["total"], detonations_meta["returned"]
+            ),
+            "attachments": _upstream_collection_meta(
+                payload, "attachments", attachments_meta["total"], attachments_meta["returned"]
+            ),
+            "takedown_timeline": _upstream_collection_meta(
+                payload, "takedown_timeline", timeline_meta["total"], timeline_meta["returned"]
+            ),
+        },
+    }
+
+
+@mcp.tool()
+async def get_takedown_status(submission_id: int) -> str:
+    """Get account-bound ThreatDrop case state and takedown-workflow status."""
+    try:
+        submission_id = _validate_submission_id(submission_id)
+        payload = await _get(
+            f"/api/v1/blackdome/threatdrop/submissions/{submission_id}/mcp-summary"
+        )
+        return json.dumps(_takedown_status_subset(payload), indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_customer_intelligence_error(exc)
 
 
 # ---------------------------------------------------------------------------

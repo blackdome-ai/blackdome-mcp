@@ -2,15 +2,19 @@
 
 # BlackDome MCP Server
 
-Give your AI agents direct access to **live honeypot threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, profile threat actors, and render a real-time global attack map — all from Claude, Cursor, or any MCP-compatible client.
+Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
-Most tools are **free and need no API key** (the public community tier). A subset of high-value intelligence requires a paid plan.
+Package version: `0.4.0`
+
+Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
+
+Community tools are **free and need no API key**. The tool table identifies the product features required for paid intelligence.
 
 ## Quick Start
 
-### Option 1 — Cloud MCP (recommended, no install)
+### Option 1 — Separately hosted streamable-HTTP MCP (recommended, no install)
 
-One URL, works in every client that supports remote MCP (Claude Desktop, the claude.ai web app, mobile, Cursor):
+One hosted streamable-HTTP endpoint for compatible remote MCP clients (Claude Desktop, the claude.ai web app, mobile, Cursor):
 
 ```
 https://api.blackdome.ai/mcp
@@ -31,17 +35,17 @@ Free tools work with no key. To unlock the paid tiers (credential intelligence, 
 }
 ```
 
-### Option 2 — Run it locally
+### Option 2 — Run locally
 
-Use `uvx` (part of [uv](https://docs.astral.sh/uv/)) — it fetches and runs the server on demand, with no separate install step and no PATH issues:
+Use `uvx` (part of [uv](https://docs.astral.sh/uv/)) to fetch and run the server on demand:
 
 ```bash
 uvx blackdome-mcp
 ```
 
-Prefer a fixed install? `pip install blackdome-mcp` works too — but note the troubleshooting item at the bottom if your client says "command not found".
+For a fixed install, use `pip install blackdome-mcp`.
 
-The free public tools work with **no API key**. To unlock the paid tiers, get a key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)**.
+The free community tools use **no API key**. To unlock paid tiers, get a key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)**.
 
 #### Claude Desktop
 
@@ -117,19 +121,25 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `recent_iocs` | **Free** | Browse recent redacted IOCs — type/severity filters (72h community delay, 25-row cap) |
 | `ioc_trends` | **Free** | Aggregated IOC trends — totals, breakdowns, daily new, top MITRE |
 | `export_iocs` | **Free** (json/csv) · **Pro** (stix) | Export the IOC feed; STIX bundle needs the `stix_export` feature |
-| `search_credentials` | **Enterprise** (`credential_intel`) | Search the global credential corpus with PLAINTEXT passwords |
-| `credential_stats` | **Enterprise** (`credential_intel`) | Aggregate credential stats — top usernames/passwords, breakdowns |
-| `list_payloads` | **Pro** (`api_access`) | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
-| `get_actor` | **Pro** (`api_access`) | List clustered threat actors, or fetch one actor's sessions |
-| `warboard` | **Pro** (`api_access`) | Sigil leaderboard with intrusion narratives + attacker command tails |
-| `list_notable_sessions` | **Enterprise** (`session_intel`) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
-| `get_session_transcript` | **Enterprise** (`session_intel`) | Structured command/output transcript for one attacker session |
+| `search_credentials` | **Credential Intelligence or candidate Enterprise/OEM pilot** (`credential_intel` or `realtime_credential_feed`) | Search the global credential corpus with PLAINTEXT passwords |
+| `credential_stats` | **Credential Intelligence or candidate Enterprise/OEM pilot** (`credential_intel` or `realtime_credential_feed`) | Aggregate credential stats — top usernames/passwords, breakdowns |
+| `list_payloads` | Requires `api_access` | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
+| `get_actor` | Requires `api_access` | List clustered threat actors, or fetch one actor's sessions |
+| `warboard` | Requires `api_access` | Sigil leaderboard with intrusion narratives + attacker command tails |
+| `list_notable_sessions` | **Candidate Enterprise/OEM pilot** (`session_intel`) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
+| `get_session_transcript` | **Candidate Enterprise/OEM pilot** (`session_intel`) | Structured command/output transcript for one attacker session |
 | `list_detonations` | **Pro** (`detonation_intel`) | Malware detonation list with verdicts, Magika labels and IOC counts |
 | `get_detonation_report` | **Pro** (`detonation_intel`) | Full detonation report with behavior, IOCs, artifact classification and report availability |
 | `get_artifact` | **Pro** (`detonation_intel`) | Artifact dossier with linked detonation, IOCs and session identifiers only |
+| `explain_ioc` | **Analyst** (`ioc_explanation`) | Observed evidence for an IP, domain, or URL |
+| `compare_samples` | **Pro** (`sample_compare`) | Deterministic comparison of two SHA-256 samples |
+| `get_evidence_cluster` | **Pro** (`genome_clusters`) | Bounded evidence cluster for a SHA-256, IP, domain, or URL |
+| `get_reproducible_novelty` | **Pro** (`reproducible_novelty`) | Reproducible behavior assessment for a SHA-256, IP, domain, or URL |
+| `get_threatdrop_case` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's sanitized case state; separate ThreatDrop product entitlement |
+| `get_takedown_status` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's public case counts and takedown workflow status, including replies, outcome, and timeline |
 | `whoami` | **Any key** | Check your tenant, plan, features and live quota |
 
-**Plans:** Community (free) → Analyst ($49, real-time intel) → Pro ($299, adds `stix_export`, `api_access`, `detonation_intel`) → Enterprise ($2000, adds `credential_intel`, `bulk_api`, `session_intel`) → OEM ($5000). See [pricing](https://blackdome.ai/pricing).
+**Feature gates:** tool availability is enforced by the returned plan features, including `api_access`, `stix_export`, `credential_intel` or `realtime_credential_feed`, `detonation_intel`, `session_intel`, `ioc_explanation`, `sample_compare`, `genome_clusters`, and `reproducible_novelty`. ThreatDrop tools require a separate ThreatDrop product entitlement. See [pricing](https://blackdome.ai/pricing).
 
 ## Example Prompts
 
@@ -143,12 +153,17 @@ Once connected, try asking your AI assistant:
 - *"Export the IOC feed as CSV so I can load it into my SIEM."*
 - *"What plan am I on and which features do I have?"* (runs `whoami`)
 - *"Search captured SSH credentials for the username root."* (paid)
-- *"Show me the most active hand-keyed attacker sessions this week."* (Enterprise)
+- *"Show me the most active hand-keyed attacker sessions this week."* (candidate Enterprise/OEM pilot)
 - *"Pull the detonation report for sha256 a6713518f2e26745683d33ded61b465d0645d7af850464c559fba8bb84e68398."* (Pro)
+- *"Explain the observed evidence for domain example.test."* (Analyst)
+- *"Compare these two SHA-256 samples deterministically."* (Pro)
+- *"Show the bounded evidence cluster for this IOC."* (Pro)
+- *"What reproducible novelty does this URL show?"* (Pro)
+- *"Show the ThreatDrop case state and takedown workflow status for submission 42."* (ThreatDrop)
 
 ## Environment Variables
 
-Local (stdio) server only — the cloud endpoint takes the key as an `Authorization: Bearer` header instead.
+The package runs locally over stdio; the separately hosted streamable-HTTP endpoint takes the key as an `Authorization: Bearer` header instead. The registry manifest declares only the package's stdio transport.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -158,19 +173,20 @@ Local (stdio) server only — the cloud endpoint takes the key as an `Authorizat
 
 ## Rate Limits
 
-The free community tier is capped at roughly **30 requests/minute** and **100 requests/day**, and community IOC data carries a **72-hour freshness delay**. Paid plans raise these limits substantially (Enterprise: 1000 req/min, 50,000 req/day). When you hit a limit the server returns a clear `429` error with retry timing. Use `whoami` to see your live quota.
+The free community tier is capped at roughly **30 requests/minute** and **100 requests/day**, and community IOC data carries a **72-hour freshness delay**. Current paid-plan limits are returned by `whoami`; candidate Enterprise/OEM pilots are contact-led and do not have fixed public limits. When you hit a limit the server returns a clear `429` error with retry timing.
 
 ## Troubleshooting
 
-- **"command not found" in a GUI client:** GUI apps don't load your shell PATH. Easiest fix: use `"command": "uvx", "args": ["blackdome-mcp"]` as shown above. If you pip-installed instead, run `which blackdome-mcp` (macOS/Linux) or `where blackdome-mcp` (Windows) and paste the full path into the `command` field.
+- **"command not found" in a GUI client:** GUI apps don't load your shell PATH. Use `"command": "uvx", "args": ["blackdome-mcp"]` as shown above. For a pip installation, run `which blackdome-mcp` (macOS/Linux) or `where blackdome-mcp` (Windows) and use the full path as the `command`.
 - **Paid tools return 401/403:** see [API Key Behavior](#api-key-behavior) — errors are explicit, and `whoami` tells you exactly what your key grants.
 
 ## Security
 
-- **Read-only.** Every tool is a GET request — the server never mutates BlackDome data.
+- **Read-only.** Tools use GET or semantically read-only JSON-body POST requests; none mutates BlackDome data.
 - **Keyless free tier.** Public tools require no API key and expose only community-tier data.
-- **Masked credentials.** The free `lookup_attacker_ip` tool masks captured passwords to `********` before returning them; `credential_preview` is masked server-side. Plaintext passwords are returned **only** by the paid `search_credentials` tool, which requires the `credential_intel` feature.
+- **Masked credentials.** The free `lookup_attacker_ip` tool masks captured passwords to `********` before returning them; `credential_preview` is masked server-side. Plaintext passwords are returned **only** by the paid `search_credentials` tool, which requires `credential_intel` or `realtime_credential_feed`.
 - **Secrets stay local.** Your API key is read from the environment and sent only to the BlackDome API over HTTPS. No data is stored by the MCP server — it proxies directly to BlackDome.
+- **Customer intelligence.** Retrieve observed evidence, deterministic comparisons, reproducible behavior assessments, case state and takedown-workflow status.
 
 ## License
 

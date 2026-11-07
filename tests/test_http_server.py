@@ -1,13 +1,11 @@
 """Tests for the streamable-HTTP hosted transport (no live calls)."""
 
 import asyncio
-import json
 
 import httpx
 import pytest
 
 import blackdome_mcp.server as server
-from blackdome_mcp import http_server
 from blackdome_mcp.http_server import ApiKeyCapture, _extract_key, create_http_app
 
 
