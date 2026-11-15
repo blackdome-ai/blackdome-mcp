@@ -28,7 +28,7 @@ jobs:
           uv build
           uv venv --python python /tmp/blackdome-wheel
           uv pip install --python /tmp/blackdome-wheel/bin/python dist/*.whl
-      - name: Test built artifacts and all 26 tools over stdio
+      - name: Test built artifacts and all 31 tools over stdio
         env:
           BLACKDOME_API_KEY: ""
           BLACKDOME_TEST_PYTHON: /tmp/blackdome-wheel/bin/python

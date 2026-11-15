@@ -1306,6 +1306,178 @@ async def get_takedown_status(submission_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Specimen catalogue tools (keyed, read-only; Pro: genome_clusters)
+#
+# The shared honeypot catalogue of captured malware specimens: families, builds,
+# indicators and lineage. Never returns the files themselves. Selectors (family,
+# sha256, search text) travel only in JSON bodies, never in URLs.
+# ---------------------------------------------------------------------------
+
+_CATALOGUE_FAMILY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._/-]{1,62}$")
+_CATALOGUE_KINDS = {"script", "program", "archive", "other"}
+_CATALOGUE_FAMILY_PAGE_MAX = 100
+_CATALOGUE_MEMBER_PAGE_MAX = 200
+_CATALOGUE_RECENT_MAX = 100
+_CATALOGUE_SEARCH_MAX = 50
+_CATALOGUE_OFFSET_MAX = 10_000
+
+
+def _validate_offset(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _CATALOGUE_OFFSET_MAX:
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _validate_family(value: object) -> str:
+    if type(value) is not str or not _CATALOGUE_FAMILY_RE.fullmatch(value):
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _validate_catalogue_query(value: object) -> str:
+    if type(value) is not str or not 4 <= len(value) <= 120 or value != value.strip() or not value.isprintable():
+        raise _CustomerIntelligenceValidationError
+    return value
+
+
+def _format_catalogue_error(exc: Exception) -> str:
+    """Explicit status, never the server's own message (which could echo a selector)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 403:
+            return ("Access denied (403): the specimen catalogue needs a Pro plan or higher "
+                    "(feature genome_clusters). See https://blackdome.ai/pricing.")
+        if status == 404:
+            return "Not found (404): nothing in the specimen catalogue matches."
+        if status == 503:
+            return "Specimen catalogue unavailable (503). Try again shortly."
+    return _format_customer_intelligence_error(exc)
+
+
+@mcp.tool()
+async def list_catalogue_families(limit: int = 25, offset: int = 0) -> str:
+    """List malware specimen families in the shared honeypot catalogue, newest first (Pro: genome_clusters).
+
+    Each family groups captured scripts and programs that share code or were
+    delivered together, with its tools, behaviour patterns and MITRE techniques.
+
+    Args:
+        limit: Families per page (1-100, default 25)
+        offset: Families to skip (0-10000)
+    """
+    try:
+        limit = min(_validate_positive_int(limit), _CATALOGUE_FAMILY_PAGE_MAX)
+        offset = _validate_offset(offset)
+        payload = await _get(
+            "/api/v1/blackdome/intelligence/catalogue/families",
+            {"limit": limit, "offset": offset},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_catalogue_error(exc)
+
+
+@mcp.tool()
+async def get_catalogue_family(family: str, member_limit: int = 50, member_offset: int = 0) -> str:
+    """Get one specimen family: members, build history, tools, indicators and related families (Pro: genome_clusters).
+
+    Related families share a wallet or control server (same operator) or a
+    download host (same infrastructure); each comes with what they share.
+
+    Args:
+        family: Family key (12 hex), name (e.g. "mozi-007ba229e43c") or key prefix
+        member_limit: Members per page (1-200, default 50)
+        member_offset: Members to skip (0-10000)
+    """
+    try:
+        family = _validate_family(family)
+        member_limit = min(_validate_positive_int(member_limit), _CATALOGUE_MEMBER_PAGE_MAX)
+        member_offset = _validate_offset(member_offset)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/catalogue/family",
+            {"family": family, "member_limit": member_limit, "member_offset": member_offset},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_catalogue_error(exc)
+
+
+@mcp.tool()
+async def get_catalogue_specimen(sha256: str) -> str:
+    """Get one catalogued specimen: kind, traits, indicators, family and lineage (Pro: genome_clusters).
+
+    Lineage covers the command that fetched it and the hosts that command named
+    or reached, what it fetched, the build it replaced and later builds. The
+    file itself is never returned.
+
+    Args:
+        sha256: Lowercase SHA-256 of the specimen
+    """
+    try:
+        sha256 = _validate_sha256(sha256)
+        payload = await _post("/api/v1/blackdome/intelligence/catalogue/specimen", {"sha256": sha256})
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_catalogue_error(exc)
+
+
+@mcp.tool()
+async def search_catalogue(query: str, limit: int = 20) -> str:
+    """Search the specimen catalogue by hash prefix, indicator or family (Pro: genome_clusters).
+
+    Matches a SHA-256 prefix (6+ hex digits), any download host, mining pool,
+    wallet or control endpoint containing the text, and family keys and names.
+
+    Args:
+        query: 4-120 characters
+        limit: Maximum specimens and families returned (1-50, default 20)
+    """
+    try:
+        query = _validate_catalogue_query(query)
+        limit = min(_validate_positive_int(limit), _CATALOGUE_SEARCH_MAX)
+        payload = await _post(
+            "/api/v1/blackdome/intelligence/catalogue/search",
+            {"query": query, "limit": limit},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_catalogue_error(exc)
+
+
+@mcp.tool()
+async def recent_catalogue_specimens(limit: int = 20, offset: int = 0, kind: Optional[str] = None) -> str:
+    """List the most recently seen specimens in the shared catalogue (Pro: genome_clusters).
+
+    Args:
+        limit: Specimens per page (1-100, default 20)
+        offset: Specimens to skip (0-10000)
+        kind: Optional filter: script, program, archive or other
+    """
+    try:
+        limit = min(_validate_positive_int(limit), _CATALOGUE_RECENT_MAX)
+        offset = _validate_offset(offset)
+        if kind is not None and kind not in _CATALOGUE_KINDS:
+            raise _CustomerIntelligenceValidationError
+        payload = await _get(
+            "/api/v1/blackdome/intelligence/catalogue/recent",
+            {"limit": limit, "offset": offset, "kind": kind},
+        )
+        return json.dumps(payload, indent=2, default=str)
+    except _CustomerIntelligenceValidationError:
+        return _validation_error()
+    except Exception as exc:
+        return _format_catalogue_error(exc)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1323,7 +1495,7 @@ def main():
             "(search_credentials, credential_stats, list_payloads, get_actor, "
             "warboard, list_notable_sessions, get_session_transcript, "
             "list_detonations, get_detonation_report, get_artifact, whoami, "
-            "and stix export) will return 401. "
+            "the specimen catalogue tools, and stix export) will return 401. "
             "Get a key at https://blackdome.ai/pricing.",
             file=sys.stderr,
         )

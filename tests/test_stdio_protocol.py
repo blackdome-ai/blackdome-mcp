@@ -56,6 +56,12 @@ CASES = [
     ("get_actor", {"actor_id": "fixture-actor"}, "GET", BASE + "/actors/fixture-actor/sessions", {"limit": "20"}),
     ("explain_ioc", {"indicator_type": "ip", "indicator_value": "192.0.2.7"}, "POST", BASE + "/intelligence/ioc/explain", {"indicator_type": "ip", "value": "192.0.2.7"}),
     ("explain_ioc", {"indicator_type": "url", "indicator_value": "https://example.test/x"}, "POST", BASE + "/intelligence/ioc/explain", {"indicator_type": "url", "value": "https://example.test/x"}),
+    ("list_catalogue_families", {"limit": 500, "offset": 3}, "GET", BASE + "/intelligence/catalogue/families", {"limit": "100", "offset": "3"}),
+    ("get_catalogue_family", {"family": "mozi-007ba229e43c", "member_limit": 999}, "POST", BASE + "/intelligence/catalogue/family", {"family": "mozi-007ba229e43c", "member_limit": 200, "member_offset": 0}),
+    ("get_catalogue_specimen", {"sha256": SHA}, "POST", BASE + "/intelligence/catalogue/specimen", {"sha256": SHA}),
+    ("search_catalogue", {"query": "example.test", "limit": 99}, "POST", BASE + "/intelligence/catalogue/search", {"query": "example.test", "limit": 50}),
+    ("recent_catalogue_specimens", {"limit": 2, "kind": "program"}, "GET", BASE + "/intelligence/catalogue/recent", {"limit": "2", "offset": "0", "kind": "program"}),
+    ("recent_catalogue_specimens", {}, "GET", BASE + "/intelligence/catalogue/recent", {"limit": "20", "offset": "0"}),
 ]
 PUBLIC = {case[0] for case in CASES[:9]}
 
@@ -154,10 +160,10 @@ def test_installed_stdio_all_tools(mode, tmp_path):
                 async with stdio_client(params, errlog=stderr) as (read, write):
                     async with ClientSession(read, write) as client:
                         initialized = await client.initialize()
-                        assert initialized.serverInfo.version == "0.4.0"
+                        assert initialized.serverInfo.version == "0.5.0"
                         listed = await client.list_tools()
                         assert {t.name for t in listed.tools} == {case[0] for case in CASES}
-                        assert len(listed.tools) == 26
+                        assert len(listed.tools) == 31
                         for case in CASES:
                             state["case"] = case
                             state["requests"].clear()
@@ -199,6 +205,12 @@ def test_installed_stdio_all_tools(mode, tmp_path):
                             ("get_reproducible_novelty", {"entity_kind": "invalid", "value": "secret"}),
                             ("get_threatdrop_case", {"submission_id": 0}),
                             ("get_takedown_status", {"submission_id": -1}),
+                            ("get_catalogue_family", {"family": "<script>"}),
+                            ("get_catalogue_specimen", {"sha256": SHA.upper()}),
+                            ("search_catalogue", {"query": "abc"}),
+                            ("search_catalogue", {"query": "evil\nhost"}),
+                            ("list_catalogue_families", {"offset": -1}),
+                            ("recent_catalogue_specimens", {"kind": "secret"}),
                         ]:
                             result = await client.call_tool(name, arguments)
                             assert "Invalid request parameters." in result.content[0].text

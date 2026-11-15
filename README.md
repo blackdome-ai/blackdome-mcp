@@ -4,7 +4,7 @@
 
 Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
-Package version: `0.4.0`
+Package version: `0.5.0`
 
 Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
 
@@ -137,6 +137,11 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `get_reproducible_novelty` | **Pro** (`reproducible_novelty`) | Reproducible behavior assessment for a SHA-256, IP, domain, or URL |
 | `get_threatdrop_case` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's sanitized case state; separate ThreatDrop product entitlement |
 | `get_takedown_status` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's public case counts and takedown workflow status, including replies, outcome, and timeline |
+| `list_catalogue_families` | **Pro** (`genome_clusters`) | Malware specimen families in the shared honeypot catalogue, newest first, paged |
+| `get_catalogue_family` | **Pro** (`genome_clusters`) | One family: members, build history, public tools fetched, indicators, related families and why |
+| `get_catalogue_specimen` | **Pro** (`genome_clusters`) | One specimen: kind, processor, size, traits, indicators, family and lineage (never the file itself) |
+| `search_catalogue` | **Pro** (`genome_clusters`) | Search specimens by SHA-256 prefix or host/pool/wallet/control text, and families by key or name |
+| `recent_catalogue_specimens` | **Pro** (`genome_clusters`) | The most recently seen specimens, optionally by kind (script, program, archive, other) |
 | `whoami` | **Any key** | Check your tenant, plan, features and live quota |
 
 **Feature gates:** tool availability is enforced by the returned plan features, including `api_access`, `stix_export`, `credential_intel` or `realtime_credential_feed`, `detonation_intel`, `session_intel`, `ioc_explanation`, `sample_compare`, `genome_clusters`, and `reproducible_novelty`. ThreatDrop tools require a separate ThreatDrop product entitlement. See [pricing](https://blackdome.ai/pricing).

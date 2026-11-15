@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _RELEASE_GATE_SCRIPT = _PACKAGE_ROOT / "scripts/check_release_artifact.py"
-_RELEASE_VERSION = "0.4.0"
+_RELEASE_VERSION = "0.5.0"
 _CANONICAL_SERVER_NAME = "io.github.blackdome-ai/blackdome-mcp"
 _RELEASE_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -62,6 +62,11 @@ _RELEASE_TOOL_NAMES = (
     "get_reproducible_novelty",
     "get_threatdrop_case",
     "get_takedown_status",
+    "list_catalogue_families",
+    "get_catalogue_family",
+    "get_catalogue_specimen",
+    "search_catalogue",
+    "recent_catalogue_specimens",
 )
 _README_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -89,6 +94,11 @@ _README_TOOL_NAMES = (
     "get_reproducible_novelty",
     "get_threatdrop_case",
     "get_takedown_status",
+    "list_catalogue_families",
+    "get_catalogue_family",
+    "get_catalogue_specimen",
+    "search_catalogue",
+    "recent_catalogue_specimens",
     "whoami",
 )
 
@@ -151,19 +161,19 @@ def test_release_metadata_and_public_documentation_share_one_immutable_version()
 
 
 def test_mcp_initialize_advertises_the_canonical_package_version():
-    """Initialize must identify BlackDome 0.4.0, not the FastMCP framework."""
+    """Initialize must identify the BlackDome package version, not the FastMCP framework."""
     initialization = server.mcp._mcp_server.create_initialization_options()
 
     assert initialization.server_name == "BlackDome"
     assert initialization.server_version == _RELEASE_VERSION
 
 
-def test_release_tool_contract_has_exactly_26_source_and_documented_tools():
-    """The immutable 0.4.0 release must not gain, lose, or rename a tool."""
+def test_release_tool_contract_has_exactly_31_source_and_documented_tools():
+    """The immutable 0.5.0 release must not gain, lose, or rename a tool."""
     assert _decorated_tool_names() == _RELEASE_TOOL_NAMES
     assert _readme_tool_names() == _README_TOOL_NAMES
     assert set(_README_TOOL_NAMES) == set(_RELEASE_TOOL_NAMES)
-    assert len(_RELEASE_TOOL_NAMES) == 26
+    assert len(_RELEASE_TOOL_NAMES) == 31
 
 
 def _run_release_artifact_gate(
@@ -1153,3 +1163,116 @@ async def test_customer_intelligence_errors_remain_explicit_without_echoing_sele
     assert str(status) in out or status == 503
     assert "very-secret" not in out
     assert secret_url not in out
+
+
+# ---------------------------------------------------------------------------
+# Specimen catalogue tools (read-only; selectors only in JSON bodies)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_catalogue_tools_use_their_routes_bodies_and_request_key():
+    """Changing a catalogue route, moving a selector into a URL or dropping the key would misdirect the read."""
+
+    def handler(request):
+        return json_response({"schema": "specimen-catalogue-v1"})
+
+    reset = server.set_request_api_key("customer-key")
+    try:
+        with mock_api(handler) as captured:
+            await server.list_catalogue_families(limit=10, offset=20)
+            await server.get_catalogue_family("mozi-007ba229e43c", member_limit=5, member_offset=10)
+            await server.get_catalogue_specimen("a" * 64)
+            await server.search_catalogue("pool.supportxmr.com", limit=7)
+            await server.recent_catalogue_specimens(limit=3, kind="program")
+            await server.recent_catalogue_specimens()
+    finally:
+        server._REQUEST_API_KEY.reset(reset)
+
+    base = "/api/v1/blackdome/intelligence/catalogue"
+    expected = [
+        ("GET", base + "/families", {"limit": "10", "offset": "20"}, None),
+        ("POST", base + "/family", {}, {"family": "mozi-007ba229e43c", "member_limit": 5, "member_offset": 10}),
+        ("POST", base + "/specimen", {}, {"sha256": "a" * 64}),
+        ("POST", base + "/search", {}, {"query": "pool.supportxmr.com", "limit": 7}),
+        ("GET", base + "/recent", {"limit": "3", "offset": "0", "kind": "program"}, None),
+        ("GET", base + "/recent", {"limit": "20", "offset": "0"}, None),
+    ]
+    assert len(captured) == len(expected)
+    for request, (method, path, params, body) in zip(captured, expected, strict=True):
+        assert request.method == method
+        assert request.url.path == path
+        assert dict(request.url.params) == params
+        assert request.headers["Authorization"] == "Bearer customer-key"
+        if body is not None:
+            assert json.loads(request.content) == body
+            assert "mozi" not in str(request.url) and "supportxmr" not in str(request.url)
+
+
+@pytest.mark.asyncio
+async def test_catalogue_tools_clamp_page_sizes_to_service_caps():
+    """Removing the caps would ask the service for pages it refuses."""
+
+    def handler(request):
+        return json_response({"items": []})
+
+    with mock_api(handler) as captured:
+        await server.list_catalogue_families(limit=999)
+        await server.get_catalogue_family("kit-76905372c23f", member_limit=999)
+        await server.search_catalogue("example.test", limit=999)
+        await server.recent_catalogue_specimens(limit=999)
+
+    assert captured[0].url.params["limit"] == "100"
+    assert json.loads(captured[1].content)["member_limit"] == 200
+    assert json.loads(captured[2].content)["limit"] == 50
+    assert captured[3].url.params["limit"] == "100"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "args", "secret"),
+    [
+        ("get_catalogue_family", ("<script>alert(1)</script>",), "<script>"),
+        ("get_catalogue_family", (" mozi",), "mozi"),
+        ("get_catalogue_family", ("x" * 80,), "x" * 80),
+        ("get_catalogue_specimen", ("A" * 64,), "A" * 64),
+        ("get_catalogue_specimen", ("a" * 63,), "a" * 63),
+        ("search_catalogue", ("abc",), "abc"),
+        ("search_catalogue", (" padded-query",), "padded-query"),
+        ("search_catalogue", ("evil\x1b[2Jhost",), "evil"),
+        ("search_catalogue", ("y" * 121,), "y" * 121),
+        ("search_catalogue", ("example.test", True), "example.test"),
+        ("list_catalogue_families", (0,), "0"),
+        ("list_catalogue_families", (10, -1), "-1"),
+        ("list_catalogue_families", (10, 10_001), "10001"),
+        ("recent_catalogue_specimens", (10, 0, "secret-kind"), "secret-kind"),
+        ("recent_catalogue_specimens", ("10",), "10"),
+    ],
+)
+async def test_catalogue_invalid_input_does_not_call_http(tool, args, secret):
+    """Removing local validation would send markup, control characters or unbounded pages to the API."""
+
+    def handler(request):
+        pytest.fail(f"unexpected HTTP request: {request.url}")
+
+    with mock_api(handler) as captured:
+        out = await getattr(server, tool)(*args)
+
+    assert captured == []
+    assert out == "Invalid request parameters."
+    assert secret not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 503])
+async def test_catalogue_errors_are_explicit_without_echoing_the_server_detail(status):
+    """The catalogue tools must report the status but never relay a server message verbatim."""
+
+    def handler(request):
+        return json_response({"detail": "SERVER_DETAIL_SENTINEL"}, status=status)
+
+    with mock_api(handler):
+        out = await server.search_catalogue("example.test")
+
+    assert str(status) in out
+    assert "SERVER_DETAIL_SENTINEL" not in out

@@ -18,7 +18,7 @@ from typing import Sequence
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.5.0"
 PACKAGE_NAME = "blackdome-mcp"
 EXPECTED_TOOLS = (
     "lookup_attacker_ip",
@@ -47,6 +47,11 @@ EXPECTED_TOOLS = (
     "get_reproducible_novelty",
     "get_threatdrop_case",
     "get_takedown_status",
+    "list_catalogue_families",
+    "get_catalogue_family",
+    "get_catalogue_specimen",
+    "search_catalogue",
+    "recent_catalogue_specimens",
 )
 
 
@@ -226,7 +231,7 @@ from pathlib import Path
 import sys
 import httpx
 
-assert metadata.version("blackdome-mcp") == "0.4.0"
+assert metadata.version("blackdome-mcp") == "0.5.0"
 console_scripts = {
     entry.name: entry.value
     for entry in metadata.distribution("blackdome-mcp").entry_points
@@ -242,8 +247,8 @@ assert callable(http_server.main)
 tools = asyncio.run(server.mcp.list_tools())
 names = tuple(tool.name for tool in tools)
 assert names == __EXPECTED_TOOLS__
-assert len(names) == 26
-assert len(set(names)) == 26
+assert len(names) == 31
+assert len(set(names)) == 31
 assert callable(http_server.create_http_app())
 
 class LifespanDriver:
@@ -380,7 +385,7 @@ def check_release_artifact(mcp_version: str | None = None) -> None:
         wheel = next(dist.glob("blackdome_mcp-{version}-*.whl".format(version=RELEASE_VERSION)), None)
         sdist = dist / "blackdome_mcp-{version}.tar.gz".format(version=RELEASE_VERSION)
         if wheel is None or not sdist.is_file():
-            raise ReleaseArtifactError("build did not create the expected 0.4.0 wheel and sdist")
+            raise ReleaseArtifactError("build did not create the expected {version} wheel and sdist".format(version=RELEASE_VERSION))
         _assert_wheel(wheel)
         _assert_sdist(sdist)
         _smoke_installed_wheel(uv, wheel, temporary_root, environment, mcp_version)
