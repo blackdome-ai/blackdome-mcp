@@ -1348,7 +1348,7 @@ def _validate_catalogue_query(value: object) -> str:
 _CATALOGUE_DENIED = {
     "Feature requires a higher plan": (
         "this account's plan does not include the specimen catalogue; it needs Threat Intel Pro or higher "
-        "(feature genome_clusters). See https://blackdome.ai/pricing."),
+        "(feature genome_clusters). See https://blackdome.ai/products/threat-intel."),
     "Subscription inactive": (
         "the subscription on this key's account is not active. Check billing in your BlackDome dashboard."),
     "Insufficient scope: requires 'read'": "this API key does not have the read scope.",
@@ -1357,7 +1357,7 @@ _CATALOGUE_DENIED = {
 }
 _CATALOGUE_DENIED_DEFAULT = (
     "the specimen catalogue needs Threat Intel Pro or higher (feature genome_clusters). "
-    "See https://blackdome.ai/pricing.")
+    "See https://blackdome.ai/products/threat-intel.")
 
 
 def _catalogue_denied_reason(response: httpx.Response) -> str:
