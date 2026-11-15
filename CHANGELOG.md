@@ -12,6 +12,10 @@
 - Validate catalogue selectors locally (family names, lowercase SHA-256,
   4-120 character search text, integer paging) before any request; send
   selectors only in JSON bodies; cap page sizes at the service limits.
+- Catalogue errors say why access was refused (plan, inactive subscription,
+  missing read scope, expired key or inactive account) without relaying the
+  server's text, and report a rejected request as invalid rather than
+  unavailable.
 
 ## 0.4.0 - 2026-11-07
 

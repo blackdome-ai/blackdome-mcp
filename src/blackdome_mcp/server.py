@@ -63,8 +63,10 @@ mcp = FastMCP(
         "credentials and malware payloads, profile threat actors, and render a "
         "real-time global attack map. Free public tools require no API key; "
         "credential, payload, actor, warboard and STIX-export tools require a "
-        "paid plan key. Captured passwords from the free attacker lookup are "
-        "masked; the paid credential tools return the full intelligence."
+        "paid plan key. The specimen catalogue tools need Threat Intel Pro or "
+        "higher (feature genome_clusters) and never return sample files. "
+        "Captured passwords from the free attacker lookup are masked; the paid "
+        "credential tools return the full intelligence."
     ),
 )
 # FastMCP 1.x does not expose a product-version constructor argument; its
@@ -1340,13 +1342,42 @@ def _validate_catalogue_query(value: object) -> str:
     return value
 
 
+# The service's 403 reasons on this path are fixed strings, raised before the request body is read, so they can
+# never contain a selector. Each known reason gets its own hint (a paying customer whose key expired must not be
+# told to upgrade); any other detail gets the generic hint. The server's text itself is never relayed.
+_CATALOGUE_DENIED = {
+    "Feature requires a higher plan": (
+        "this account's plan does not include the specimen catalogue; it needs Threat Intel Pro or higher "
+        "(feature genome_clusters). See https://blackdome.ai/pricing."),
+    "Subscription inactive": (
+        "the subscription on this key's account is not active. Check billing in your BlackDome dashboard."),
+    "Insufficient scope: requires 'read'": "this API key does not have the read scope.",
+    "API key has expired": "this API key has expired. Create a new key in your BlackDome dashboard.",
+    "Tenant account is inactive": "this BlackDome account is inactive.",
+}
+_CATALOGUE_DENIED_DEFAULT = (
+    "the specimen catalogue needs Threat Intel Pro or higher (feature genome_clusters). "
+    "See https://blackdome.ai/pricing.")
+
+
+def _catalogue_denied_reason(response: httpx.Response) -> str:
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return _CATALOGUE_DENIED_DEFAULT
+    if not isinstance(detail, str):
+        return _CATALOGUE_DENIED_DEFAULT
+    return _CATALOGUE_DENIED.get(detail, _CATALOGUE_DENIED_DEFAULT)
+
+
 def _format_catalogue_error(exc: Exception) -> str:
     """Explicit status, never the server's own message (which could echo a selector)."""
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
+        if status == 400:
+            return "Invalid request (400): the service rejected these parameters."
         if status == 403:
-            return ("Access denied (403): the specimen catalogue needs a Pro plan or higher "
-                    "(feature genome_clusters). See https://blackdome.ai/pricing.")
+            return "Access denied (403): " + _catalogue_denied_reason(exc.response)
         if status == 404:
             return "Not found (404): nothing in the specimen catalogue matches."
         if status == 503:
@@ -1360,6 +1391,7 @@ async def list_catalogue_families(limit: int = 25, offset: int = 0) -> str:
 
     Each family groups captured scripts and programs that share code or were
     delivered together, with its tools, behaviour patterns and MITRE techniques.
+    Sample files are never returned.
 
     Args:
         limit: Families per page (1-100, default 25)
@@ -1385,9 +1417,11 @@ async def get_catalogue_family(family: str, member_limit: int = 50, member_offse
 
     Related families share a wallet or control server (same operator) or a
     download host (same infrastructure); each comes with what they share.
+    Sample files are never returned.
 
     Args:
-        family: Family key (12 hex), name (e.g. "mozi-007ba229e43c") or key prefix
+        family: Family key (12 hex), name (e.g. "mozi-007ba229e43c") or a key
+            prefix that matches exactly one family
         member_limit: Members per page (1-200, default 50)
         member_offset: Members to skip (0-10000)
     """
@@ -1433,6 +1467,7 @@ async def search_catalogue(query: str, limit: int = 20) -> str:
 
     Matches a SHA-256 prefix (6+ hex digits), any download host, mining pool,
     wallet or control endpoint containing the text, and family keys and names.
+    Sample files are never returned.
 
     Args:
         query: 4-120 characters
@@ -1455,6 +1490,10 @@ async def search_catalogue(query: str, limit: int = 20) -> str:
 @mcp.tool()
 async def recent_catalogue_specimens(limit: int = 20, offset: int = 0, kind: Optional[str] = None) -> str:
     """List the most recently seen specimens in the shared catalogue (Pro: genome_clusters).
+
+    Each entry gives the specimen's hash, kind, processor, size, first and last
+    seen, family and the file names it was saved as.
+    Sample files are never returned.
 
     Args:
         limit: Specimens per page (1-100, default 20)

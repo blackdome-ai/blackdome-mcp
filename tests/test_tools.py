@@ -1276,3 +1276,63 @@ async def test_catalogue_errors_are_explicit_without_echoing_the_server_detail(s
 
     assert str(status) in out
     assert "SERVER_DETAIL_SENTINEL" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail, expected",
+    [
+        ("Feature requires a higher plan", "needs Threat Intel Pro or higher"),
+        ("Subscription inactive", "subscription on this key's account is not active"),
+        ("Insufficient scope: requires 'read'", "does not have the read scope"),
+        ("API key has expired", "this API key has expired"),
+        ("Tenant account is inactive", "this BlackDome account is inactive"),
+        ("SERVER_DETAIL_SENTINEL", "needs Threat Intel Pro or higher"),
+        (["not", "a", "string"], "needs Threat Intel Pro or higher"),
+    ],
+)
+async def test_catalogue_403_says_why_without_relaying_the_server_text(detail, expected):
+    """A paying customer whose key expired or whose subscription lapsed must not be told to upgrade."""
+
+    def handler(request):
+        return json_response({"detail": detail}, status=403)
+
+    with mock_api(handler):
+        out = await server.get_catalogue_specimen("a" * 64)
+
+    assert out.startswith("Access denied (403): ")
+    assert expected in out
+    assert "SERVER_DETAIL_SENTINEL" not in out
+
+
+@pytest.mark.asyncio
+async def test_catalogue_403_with_a_non_json_body_gets_the_generic_hint():
+    def handler(request):
+        return httpx.Response(403, text="<html>denied SERVER_DETAIL_SENTINEL</html>")
+
+    with mock_api(handler):
+        out = await server.recent_catalogue_specimens()
+
+    assert out.startswith("Access denied (403): ")
+    assert "needs Threat Intel Pro or higher" in out
+    assert "SERVER_DETAIL_SENTINEL" not in out and "<html>" not in out
+
+
+@pytest.mark.asyncio
+async def test_catalogue_400_reads_as_an_invalid_request_not_an_outage():
+    def handler(request):
+        return json_response({"detail": "SERVER_DETAIL_SENTINEL"}, status=400)
+
+    with mock_api(handler):
+        out = await server.search_catalogue("example.test")
+
+    assert out == "Invalid request (400): the service rejected these parameters."
+
+
+def test_catalogue_tool_descriptions_say_sample_files_are_never_returned():
+    """AI clients only see tool descriptions; each catalogue tool must say no sample file comes back."""
+    for name in ("list_catalogue_families", "get_catalogue_family", "get_catalogue_specimen",
+                 "search_catalogue", "recent_catalogue_specimens"):
+        doc = " ".join((getattr(server, name).__doc__ or "").split())
+        assert "never returned" in doc, name
+        assert "genome_clusters" in doc, name
