@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.1 - 2026-11-16
+
+- No tool was added, removed or renamed, and no request sent to the service
+  changed. Tool descriptions, error texts and the README now name the plans
+  on sale (Threat Intel Analyst, Threat Intel Pro, Credential Intelligence,
+  ThreatDrop API) and which plan each tool needs. The earlier "candidate
+  Enterprise/OEM pilot" and "Pro or higher" wording is gone; Enterprise is
+  "talk to us".
+- `list_payloads`, `get_actor` and `warboard` need Threat Intel Analyst or
+  Pro. The service now checks this: API access on another plan no longer
+  unlocks them.
+- The session tools (`list_notable_sessions`, `get_session_transcript`) are
+  described as needing `session_intel`, which no plan on sale includes.
+- A rate-limit error states a retry time only when the service sent one
+  (it used to print "Retry after ? seconds"). On the general tools it also
+  repeats the service's own sentence, which names the limit of your plan.
+- An access-denied error says when the cause is an expired key, an inactive
+  account or a missing scope instead of always blaming the plan.
+- Error details from the service are shortened to one line of at most 300
+  characters.
+- The README states the request limits for each plan, that a cancelled or
+  unpaid account continues as BlackDome Free, and that `export_iocs` is the
+  keyless tool with a request cap.
+
 ## 0.5.0 - 2026-11-15
 
 - Add five read-only specimen catalogue tools (Pro: `genome_clusters`):

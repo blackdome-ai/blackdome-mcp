@@ -63,8 +63,8 @@ mcp = FastMCP(
         "credentials and malware payloads, profile threat actors, and render a "
         "real-time global attack map. Free public tools require no API key; "
         "credential, payload, actor, warboard and STIX-export tools require a "
-        "paid plan key. The specimen catalogue tools need Threat Intel Pro or "
-        "higher (feature genome_clusters) and never return sample files. "
+        "paid plan key. The specimen catalogue tools need Threat Intel Pro "
+        "(feature genome_clusters) and never return sample files. "
         "Captured passwords from the free attacker lookup are masked; the paid "
         "credential tools return the full intelligence."
     ),
@@ -120,6 +120,30 @@ async def _post(path: str, body: dict[str, Any]) -> Any:
         return resp.json()
 
 
+def _retry_hint(response: httpx.Response) -> str:
+    """A retry time, only when the service sent one (per-minute limits do; the daily limit does not)."""
+    retry = response.headers.get("Retry-After", "")
+    return f" Retry after {retry} seconds." if retry.isdigit() else ""
+
+
+def _denied_reason(detail: str) -> str:
+    """Why a 403 was returned, in plain words: an expired key or an inactive account is not a plan problem."""
+    lowered = detail.lower()
+    if "expired" in lowered:
+        return "this API key has expired. Create a new key in your BlackDome dashboard."
+    if "inactive" in lowered:
+        return "this BlackDome account is inactive."
+    if "scope" in lowered:
+        return "this API key does not have the scope this tool needs (most tools need `read`)."
+    return (
+        "your plan does not include the feature this tool needs. Payloads, actors, the "
+        "warboard and indicator explanations need Threat Intel Analyst or Pro; credential "
+        "search and stats need the Credential Intelligence plan; detonation intel, the "
+        "specimen catalogue, sample comparison and STIX export need Threat Intel Pro. "
+        "See https://blackdome.ai/pricing."
+    )
+
+
 def _format_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -127,6 +151,9 @@ def _format_error(exc: Exception) -> str:
             detail = exc.response.json().get("detail", exc.response.text)
         except Exception:
             detail = exc.response.text
+        # One short line: the service's reasons are short sentences, and a proxy's error page
+        # must not be pasted into an assistant's context.
+        detail = " ".join(str(detail).split())[:300]
         if status == 401:
             return (
                 "Authentication failed (401): bad or missing API key. "
@@ -135,21 +162,10 @@ def _format_error(exc: Exception) -> str:
                 f"Server said: {detail}"
             )
         if status == 403:
-            return (
-                "Access denied (403): your plan does not include the feature "
-                "this tool needs. credential search/stats require the Credential "
-                "Intelligence plan or a candidate Enterprise/OEM pilot; session intel "
-                "requires a candidate Enterprise/OEM pilot; detonation intel and STIX export "
-                "require Pro or higher. Upgrade at https://blackdome.ai/pricing. "
-                f"Server said: {detail}"
-            )
+            return f"Access denied (403): {_denied_reason(detail)} Server said: {detail}"
         if status == 429:
-            retry = exc.response.headers.get("Retry-After", "?")
-            return (
-                f"Rate limited (429). The free community tier is capped at ~30 "
-                f"requests/min and 100 requests/day. Retry after {retry} seconds, "
-                "or upgrade your plan for a higher limit."
-            )
+            # The server's message names this account's own limit.
+            return f"Rate limited (429): {detail}" + _retry_hint(exc.response)
         return f"API error {status}: {detail}"
     return f"Request failed: {exc}"
 
@@ -262,8 +278,8 @@ def _format_customer_intelligence_error(exc: Exception) -> str:
         if status == 403:
             return "Access denied (403): your plan does not include this feature."
         if status == 429:
-            retry = exc.response.headers.get("Retry-After", "?")
-            return f"Rate limited (429). Retry after {retry} seconds."
+            # No server text on this path; a retry time only when the service sent one.
+            return "Rate limited (429): the request limit of your plan is reached." + _retry_hint(exc.response)
         return f"Customer intelligence request unavailable ({status})."
     return "Customer intelligence request unavailable."
 
@@ -512,11 +528,11 @@ async def export_iocs(
     min_severity: str = "medium",
     days: int = 30,
 ) -> str:
-    """Export the IOC threat-intel feed as json, csv (free) or stix (Pro+).
+    """Export the IOC threat-intel feed as json, csv (free) or stix (Threat Intel Pro).
 
     Branches on format: json returns a flat {feed, generated_at, count, iocs[]}
     object; csv returns the raw CSV text body; stix returns a STIX 2.1 bundle
-    (requires the stix_export feature — Pro plan or higher). json and csv work
+    (requires the stix_export feature — Threat Intel Pro). json and csv work
     on the free community tier. The feed is tenant-scoped when authenticated.
 
     Args:
@@ -575,8 +591,8 @@ async def search_credentials(
 
     Returns credential records (username, password_hash, password_plain,
     protocol, source_ip, edge, session, first/last seen, attempt counts) from
-    the shared global dataset. Requires the credential_intel feature
-    (a candidate Enterprise/OEM pilot or the standalone Credential Intelligence plan). Plaintext
+    the shared global dataset. Requires the Credential Intelligence plan
+    (feature realtime_credential_feed or credential_intel). Plaintext
     is intentionally returned here — it is NOT masked.
 
     Args:
@@ -616,7 +632,7 @@ async def credential_stats(
 
     Returns totals (unique credentials/ips/usernames), cross-protocol counts and
     top usernames/passwords from the shared global dataset. Requires the
-    credential_intel feature (a candidate Enterprise/OEM pilot or the Credential Intelligence plan).
+    Credential Intelligence plan (feature realtime_credential_feed or credential_intel).
 
     Args:
         since: ISO timestamp lower bound
@@ -634,7 +650,7 @@ async def credential_stats(
 
 @mcp.tool()
 async def list_payloads(sha256: Optional[str] = None, limit: int = 20) -> str:
-    """List captured malware payloads, or fetch one payload's full record by sha256 (paid: api_access).
+    """List captured malware payloads, or fetch one payload's full record by sha256 (Threat Intel Analyst or Pro).
 
     With no sha256 this lists payload artifacts with summary stats. With a
     sha256 it returns that artifact's full envelope (artifact + detonation +
@@ -665,7 +681,7 @@ async def get_actor(
     sort: Optional[str] = None,
     descending: Optional[bool] = None,
 ) -> str:
-    """List threat actors with risk/geo enrichment, or fetch one actor's sessions (paid: api_access).
+    """List threat actors with risk/geo enrichment, or fetch one actor's sessions (Threat Intel Analyst or Pro).
 
     With no actor_id this lists clustered actors (risk level/score, geo,
     techniques, sophistication, event counts). With an actor_id it returns that
@@ -703,7 +719,7 @@ async def warboard(
     threat: Optional[str] = None,
     public: Optional[bool] = None,
 ) -> str:
-    """Get the warboard leaderboard of earned Sigils with intrusion narratives (paid: api_access).
+    """Get the warboard leaderboard of earned Sigils with intrusion narratives (Threat Intel Analyst or Pro).
 
     Returns sigils with threat level, sophistication, persona stage, geo, MITRE
     chain glyphs, proof packs and a tail of the attacker's real shell commands.
@@ -736,14 +752,14 @@ async def list_notable_sessions(
     actor_id: Optional[str] = None,
     limit: int = 100,
 ) -> str:
-    """List rare hand-keyed attacker sessions ranked by score (candidate Enterprise/OEM pilot session_intel).
+    """List rare hand-keyed attacker sessions ranked by score (session_intel; no plan on sale includes it).
 
     Returns a flat object with count and sessions[]. Each session includes
     session_id, actor_id, ip, geo, command_count, distinct_techniques,
     primary_tactic, persona_stage, persona_score, score, first_ts, last_ts,
     novelty, dropped_artifact_count, edge_id and human_likely. Use this to
     surface the most interesting hands-on-keyboard intrusions out of botnet
-    probe noise. Requires the session_intel feature through a candidate Enterprise/OEM pilot.
+    probe noise. Requires the session_intel feature, which no plan on sale includes.
 
     Args:
         min_commands: Minimum command count (default 3)
@@ -778,13 +794,13 @@ async def get_session_transcript(
     limit: int = 500,
     offset: int = 0,
 ) -> str:
-    """Get a structured attacker session transcript (candidate Enterprise/OEM pilot session_intel).
+    """Get a structured attacker session transcript (session_intel; no plan on sale includes it).
 
     Returns {session, steps, total_steps, truncated}. The session object includes
     session_id, actor_id, ip, geo, edge_id, primary_tactic, start_ts, end_ts,
     persona_stage, persona_score and dropped_artifacts. Each step includes seq,
     ts, command, output_preview, exit_code, cwd, latency_ms, techniques and
-    guard_triggered. Requires the session_intel feature through a candidate Enterprise/OEM pilot.
+    guard_triggered. Requires the session_intel feature, which no plan on sale includes.
 
     Args:
         session_id: Session id returned by list_notable_sessions
@@ -816,7 +832,7 @@ async def list_detonations(
 
     Returns a flat object with count and detonations[]. Each detonation includes
     detonation_id, sha256, verdict, finished_at, vm_type, magika_label and
-    ioc_count. Requires the detonation_intel feature through Pro or a candidate Enterprise/OEM pilot.
+    ioc_count. Requires the detonation_intel feature (Threat Intel Pro).
 
     Args:
         verdict: Filter by verdict (e.g. "malware", "benign", "suspicious")
@@ -849,7 +865,7 @@ async def get_detonation_report(detonation_id: str) -> str:
     report_available, report_unavailable_reason, report_body, iocs[] and
     artifact classification fields. report_available=false is returned when a
     report file is missing, absent or too large. Requires the detonation_intel
-    feature through Pro or a candidate Enterprise/OEM pilot.
+    feature (Threat Intel Pro).
 
     Args:
         detonation_id: Detonation id returned by list_detonations
@@ -870,7 +886,7 @@ async def get_artifact(sha256: str) -> str:
     Returns artifact classification fields, linked detonation summary, iocs[],
     and dropped_by_session identifiers/counts only. It does not request or
     return transcript command text or output_preview fields. Requires the
-    detonation_intel feature through Pro or a candidate Enterprise/OEM pilot.
+    detonation_intel feature (Threat Intel Pro).
 
     Args:
         sha256: Artifact sha256 to inspect
@@ -908,7 +924,7 @@ async def whoami() -> str:
 
 @mcp.tool()
 async def explain_ioc(indicator_type: str, indicator_value: str) -> str:
-    """Explain observed evidence for an IP, domain, or URL (Analyst: ioc_explanation)."""
+    """Explain observed evidence for an IP, domain, or URL (Threat Intel Analyst or Pro: ioc_explanation)."""
     try:
         if indicator_type not in {"ip", "domain", "url"}:
             raise _CustomerIntelligenceValidationError
@@ -1347,7 +1363,7 @@ def _validate_catalogue_query(value: object) -> str:
 # told to upgrade); any other detail gets the generic hint. The server's text itself is never relayed.
 _CATALOGUE_DENIED = {
     "Feature requires a higher plan": (
-        "this account's plan does not include the specimen catalogue; it needs Threat Intel Pro or higher "
+        "this account's plan does not include the specimen catalogue; it needs Threat Intel Pro "
         "(feature genome_clusters). See https://blackdome.ai/products/threat-intel."),
     "Subscription inactive": (
         "the subscription on this key's account is not active. Check billing in your BlackDome dashboard."),
@@ -1356,7 +1372,7 @@ _CATALOGUE_DENIED = {
     "Tenant account is inactive": "this BlackDome account is inactive.",
 }
 _CATALOGUE_DENIED_DEFAULT = (
-    "the specimen catalogue needs Threat Intel Pro or higher (feature genome_clusters). "
+    "the specimen catalogue needs Threat Intel Pro (feature genome_clusters). "
     "See https://blackdome.ai/products/threat-intel.")
 
 

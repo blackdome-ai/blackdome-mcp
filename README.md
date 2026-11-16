@@ -4,7 +4,7 @@
 
 Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
-Package version: `0.5.0`
+Package version: `0.5.1`
 
 Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
 
@@ -100,9 +100,13 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per project):
 ## API Key Behavior
 
 - **No key:** free community tools work; paid tools return an explicit `401`.
-- **Invalid key:** paid tools (and `whoami`) fail loudly with `401 Invalid API key` — there is **no silent fallback** to free-tier results. Free tools keep working regardless of key validity.
-- **Expired key / cancelled plan:** `403 API key has expired` / `403 Tenant account is inactive` — again explicit errors, not degraded data.
-- **Valid key, wrong plan:** a tool whose feature your plan does not include returns an explicit `403`; check your granted features any time with `whoami`.
+- **Invalid key:** paid tools (and `whoami`) fail loudly with `401 Invalid API key` — there is **no silent fallback** to free-tier results. Free tools keep working regardless of key validity, except `export_iocs`, which refuses a bad key with `401` instead of treating the call as keyless.
+- **Expired key:** `403 API key has expired`.
+- **Cancelled, lapsed or unpaid plan:** the account continues as BlackDome Free, so a paid tool returns an explicit `403` and the free tools keep working.
+- **Suspended account:** `403 Tenant account is inactive`.
+- **Valid key, wrong plan:** a tool your plan does not include returns an explicit `403`; check your plan and its features any time with `whoami`. A feature name alone does not settle it: `api_access` on a ThreatDrop API or Credential Intelligence key covers that product's own endpoints, while payloads, actors, the warboard and explanations also need a Threat Intel plan (Analyst or Pro).
+- **Key without the `read` scope:** gated tools return `403`.
+- **A key on a plan without the indicator feed** (ThreatDrop API only): `export_iocs` returns `403`. Call it without a key for the keyless export.
 
 If a paid tool returns less than expected, run `whoami` first — it reports your plan, features, and live quota.
 
@@ -121,22 +125,22 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `recent_iocs` | **Free** | Browse recent redacted IOCs — type/severity filters (72h community delay, 25-row cap) |
 | `ioc_trends` | **Free** | Aggregated IOC trends — totals, breakdowns, daily new, top MITRE |
 | `export_iocs` | **Free** (json/csv) · **Pro** (stix) | Export the IOC feed; STIX bundle needs the `stix_export` feature |
-| `search_credentials` | **Credential Intelligence or candidate Enterprise/OEM pilot** (`credential_intel` or `realtime_credential_feed`) | Search the global credential corpus with PLAINTEXT passwords |
-| `credential_stats` | **Credential Intelligence or candidate Enterprise/OEM pilot** (`credential_intel` or `realtime_credential_feed`) | Aggregate credential stats — top usernames/passwords, breakdowns |
-| `list_payloads` | Requires `api_access` | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
-| `get_actor` | Requires `api_access` | List clustered threat actors, or fetch one actor's sessions |
-| `warboard` | Requires `api_access` | Sigil leaderboard with intrusion narratives + attacker command tails |
-| `list_notable_sessions` | **Candidate Enterprise/OEM pilot** (`session_intel`) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
-| `get_session_transcript` | **Candidate Enterprise/OEM pilot** (`session_intel`) | Structured command/output transcript for one attacker session |
+| `search_credentials` | **Credential Intelligence** (`credential_intel` or `realtime_credential_feed`) | Search the global credential corpus with PLAINTEXT passwords |
+| `credential_stats` | **Credential Intelligence** (`credential_intel` or `realtime_credential_feed`) | Aggregate credential stats — top usernames/passwords, breakdowns |
+| `list_payloads` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
+| `get_actor` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List clustered threat actors, or fetch one actor's sessions |
+| `warboard` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | Sigil leaderboard with intrusion narratives + attacker command tails |
+| `list_notable_sessions` | **Not on sale** (`session_intel`; no plan on sale includes it) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
+| `get_session_transcript` | **Not on sale** (`session_intel`; no plan on sale includes it) | Structured command/output transcript for one attacker session |
 | `list_detonations` | **Pro** (`detonation_intel`) | Malware detonation list with verdicts, Magika labels and IOC counts |
 | `get_detonation_report` | **Pro** (`detonation_intel`) | Full detonation report with behavior, IOCs, artifact classification and report availability |
 | `get_artifact` | **Pro** (`detonation_intel`) | Artifact dossier with linked detonation, IOCs and session identifiers only |
-| `explain_ioc` | **Analyst** (`ioc_explanation`) | Observed evidence for an IP, domain, or URL |
+| `explain_ioc` | **Analyst or Pro** (`ioc_explanation`) | Observed evidence for an IP, domain, or URL |
 | `compare_samples` | **Pro** (`sample_compare`) | Deterministic comparison of two SHA-256 samples |
 | `get_evidence_cluster` | **Pro** (`genome_clusters`) | Bounded evidence cluster for a SHA-256, IP, domain, or URL |
 | `get_reproducible_novelty` | **Pro** (`reproducible_novelty`) | Reproducible behavior assessment for a SHA-256, IP, domain, or URL |
-| `get_threatdrop_case` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's sanitized case state; separate ThreatDrop product entitlement |
-| `get_takedown_status` | **ThreatDrop Pro or candidate Enterprise pilot** (`api_access`) | Authenticated account's public case counts and takedown workflow status, including replies, outcome, and timeline |
+| `get_threatdrop_case` | **ThreatDrop API** only (`api_access` on that plan) | Authenticated account's sanitized case state; separate ThreatDrop product entitlement |
+| `get_takedown_status` | **ThreatDrop API** only (`api_access` on that plan) | Authenticated account's public case counts and takedown workflow status, including replies, outcome, and timeline |
 | `list_catalogue_families` | **Pro** (`genome_clusters`) | Malware specimen families in the shared honeypot catalogue, newest first, paged |
 | `get_catalogue_family` | **Pro** (`genome_clusters`) | One family: members, build history, public tools fetched, indicators, related families and why |
 | `get_catalogue_specimen` | **Pro** (`genome_clusters`) | One specimen: kind, processor, size, traits, indicators, family and lineage (never the file itself) |
@@ -158,9 +162,8 @@ Once connected, try asking your AI assistant:
 - *"Export the IOC feed as CSV so I can load it into my SIEM."*
 - *"What plan am I on and which features do I have?"* (runs `whoami`)
 - *"Search captured SSH credentials for the username root."* (paid)
-- *"Show me the most active hand-keyed attacker sessions this week."* (candidate Enterprise/OEM pilot)
 - *"Pull the detonation report for sha256 a6713518f2e26745683d33ded61b465d0645d7af850464c559fba8bb84e68398."* (Pro)
-- *"Explain the observed evidence for domain example.test."* (Analyst)
+- *"Explain the observed evidence for domain example.test."* (Analyst or Pro)
 - *"Compare these two SHA-256 samples deterministically."* (Pro)
 - *"Show the bounded evidence cluster for this IOC."* (Pro)
 - *"What reproducible novelty does this URL show?"* (Pro)
@@ -178,7 +181,7 @@ The package runs locally over stdio; the separately hosted streamable-HTTP endpo
 
 ## Rate Limits
 
-The free community tier is capped at roughly **30 requests/minute** and **100 requests/day**, and community IOC data carries a **72-hour freshness delay**. Current paid-plan limits are returned by `whoami`; candidate Enterprise/OEM pilots are contact-led and do not have fixed public limits. When you hit a limit the server returns a clear `429` error with retry timing.
+Without an API key, the indicator export (`export_iocs`) is capped at about **30 requests a minute** and **100 a day**. With a key the limits are your plan's: BlackDome Free 60 a minute and 100 a day; Threat Intel Analyst 60 a minute and 200 a day; Threat Intel Pro, Credential Intelligence and ThreatDrop API 300 a minute and 5,000 a day. `whoami` returns the limits of your key. Indicators are **72 hours behind live** without a key and on BlackDome Free; Threat Intel Analyst, Threat Intel Pro and Credential Intelligence get the feed without that delay through `export_iocs`. `recent_iocs` and `ioc_trends` are the public preview and are always 72 hours behind. Enterprise: talk to us (sales@blackdome.ai). When you hit a limit the server returns a `429` error that names the limit of your plan.
 
 ## Troubleshooting
 

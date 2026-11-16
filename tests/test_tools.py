@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _RELEASE_GATE_SCRIPT = _PACKAGE_ROOT / "scripts/check_release_artifact.py"
-_RELEASE_VERSION = "0.5.0"
+_RELEASE_VERSION = "0.5.1"
 _CANONICAL_SERVER_NAME = "io.github.blackdome-ai/blackdome-mcp"
 _RELEASE_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -169,7 +169,7 @@ def test_mcp_initialize_advertises_the_canonical_package_version():
 
 
 def test_release_tool_contract_has_exactly_31_source_and_documented_tools():
-    """The immutable 0.5.0 release must not gain, lose, or rename a tool."""
+    """The immutable 0.5.1 release must not gain, lose, or rename a tool."""
     assert _decorated_tool_names() == _RELEASE_TOOL_NAMES
     assert _readme_tool_names() == _README_TOOL_NAMES
     assert set(_README_TOOL_NAMES) == set(_RELEASE_TOOL_NAMES)
@@ -563,6 +563,96 @@ async def test_format_error_429():
     assert "429" in out
     assert "30" in out
     assert "Rate limited" in out
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_message_names_the_plan_limit_and_gives_a_retry_time_only_when_sent():
+    sentence = "Daily request limit reached: Threat Intel Pro allows 5000 requests a day."
+
+    def daily(request):                      # the daily limit sends no Retry-After
+        return httpx.Response(429, json={"detail": sentence})
+
+    with mock_api(daily):
+        out = await server.top_attackers()
+    assert out == f"Rate limited (429): {sentence}"
+    assert "?" not in out and "Retry after" not in out
+
+    def per_minute(request):
+        return httpx.Response(429, json={"detail": "Rate limit reached: BlackDome Free allows 60 requests a minute."},
+                              headers={"Retry-After": "31"})
+
+    with mock_api(per_minute):
+        out = await server.top_attackers()
+    assert out == "Rate limited (429): Rate limit reached: BlackDome Free allows 60 requests a minute. Retry after 31 seconds."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers,expected", [
+    ({}, "Rate limited (429): the request limit of your plan is reached."),
+    ({"Retry-After": "31"}, "Rate limited (429): the request limit of your plan is reached. Retry after 31 seconds."),
+    ({"Retry-After": "soon"}, "Rate limited (429): the request limit of your plan is reached."),
+])
+async def test_customer_intelligence_and_catalogue_tools_never_say_retry_after_question_mark(headers, expected):
+    def handler(request):
+        return httpx.Response(429, json={"detail": "SERVER_DETAIL_SENTINEL"}, headers=headers)
+
+    with mock_api(handler):
+        explained = await server.explain_ioc("ip", "192.0.2.7")
+        families = await server.list_catalogue_families()
+    for out in (explained, families):
+        assert out == expected
+        assert "?" not in out and "SERVER_DETAIL_SENTINEL" not in out      # no server text on this path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail,says,not_plan", [
+    ("API key has expired", "this API key has expired", True),
+    ("Tenant account is inactive", "this BlackDome account is inactive", True),
+    ("Insufficient scope: requires 'read'", "does not have the scope", True),
+    ("This endpoint needs a Threat Intel plan (Analyst or Pro). Current plan: threatdrop_pro",
+     "need Threat Intel Analyst or Pro", False),
+    ("Feature 'api_access' requires a higher plan. Current plan: free", "your plan does not include the feature", False),
+])
+async def test_access_denied_names_the_real_cause(detail, says, not_plan):
+    def handler(request):
+        return httpx.Response(403, json={"detail": detail})
+
+    with mock_api(handler):
+        out = await server.list_payloads()
+    assert out.startswith("Access denied (403): ") and says in out and out.endswith(f"Server said: {detail}")
+    assert ("your plan does not include" not in out) == not_plan
+
+
+def test_every_gated_tool_description_names_a_plan_on_sale_or_says_none_does():
+    """What an assistant reads must let it tell the user which plan to buy (or that none is on sale)."""
+    import asyncio
+
+    tools = {tool.name: (tool.description or "") for tool in asyncio.run(server.mcp.list_tools())}
+    expect = {
+        "list_payloads": "Threat Intel Analyst or Pro", "get_actor": "Threat Intel Analyst or Pro",
+        "warboard": "Threat Intel Analyst or Pro", "explain_ioc": "Threat Intel Analyst or Pro",
+        "search_credentials": "Credential Intelligence", "credential_stats": "Credential Intelligence",
+        "list_detonations": "Threat Intel Pro", "get_detonation_report": "Threat Intel Pro",
+        "get_artifact": "Threat Intel Pro",
+        "list_notable_sessions": "no plan on sale includes", "get_session_transcript": "no plan on sale includes",
+    }
+    for name, phrase in expect.items():
+        assert phrase in tools[name], (name, tools[name][:160])
+    everything = " ".join(tools.values())
+    assert "pilot" not in everything.lower() and "or higher" not in everything and "paid: api_access" not in everything
+
+
+@pytest.mark.asyncio
+async def test_an_error_page_from_a_proxy_is_not_pasted_into_the_result():
+    page = "<html>" + "<p>upstream timed out</p>\n" * 400 + "</html>"
+
+    def handler(request):
+        return httpx.Response(502, text=page)
+
+    with mock_api(handler):
+        out = await server.top_attackers()
+    assert out.startswith("API error 502: ")
+    assert len(out) <= len("API error 502: ") + 300 and "\n" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1282,13 +1372,13 @@ async def test_catalogue_errors_are_explicit_without_echoing_the_server_detail(s
 @pytest.mark.parametrize(
     "detail, expected",
     [
-        ("Feature requires a higher plan", "needs Threat Intel Pro or higher"),
+        ("Feature requires a higher plan", "needs Threat Intel Pro (feature genome_clusters)"),
         ("Subscription inactive", "subscription on this key's account is not active"),
         ("Insufficient scope: requires 'read'", "does not have the read scope"),
         ("API key has expired", "this API key has expired"),
         ("Tenant account is inactive", "this BlackDome account is inactive"),
-        ("SERVER_DETAIL_SENTINEL", "needs Threat Intel Pro or higher"),
-        (["not", "a", "string"], "needs Threat Intel Pro or higher"),
+        ("SERVER_DETAIL_SENTINEL", "needs Threat Intel Pro (feature genome_clusters)"),
+        (["not", "a", "string"], "needs Threat Intel Pro (feature genome_clusters)"),
     ],
 )
 async def test_catalogue_403_says_why_without_relaying_the_server_text(detail, expected):
@@ -1314,7 +1404,7 @@ async def test_catalogue_403_with_a_non_json_body_gets_the_generic_hint():
         out = await server.recent_catalogue_specimens()
 
     assert out.startswith("Access denied (403): ")
-    assert "needs Threat Intel Pro or higher" in out
+    assert "needs Threat Intel Pro (feature genome_clusters)" in out
     assert "SERVER_DETAIL_SENTINEL" not in out and "<html>" not in out
 
 
