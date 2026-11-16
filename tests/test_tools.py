@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _RELEASE_GATE_SCRIPT = _PACKAGE_ROOT / "scripts/check_release_artifact.py"
-_RELEASE_VERSION = "0.5.1"
+_RELEASE_VERSION = "0.5.2"
 _CANONICAL_SERVER_NAME = "io.github.blackdome-ai/blackdome-mcp"
 _RELEASE_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -169,7 +169,7 @@ def test_mcp_initialize_advertises_the_canonical_package_version():
 
 
 def test_release_tool_contract_has_exactly_31_source_and_documented_tools():
-    """The immutable 0.5.1 release must not gain, lose, or rename a tool."""
+    """The immutable 0.5.2 release must not gain, lose, or rename a tool."""
     assert _decorated_tool_names() == _RELEASE_TOOL_NAMES
     assert _readme_tool_names() == _README_TOOL_NAMES
     assert set(_README_TOOL_NAMES) == set(_RELEASE_TOOL_NAMES)

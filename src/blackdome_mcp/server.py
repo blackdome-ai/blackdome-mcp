@@ -324,8 +324,13 @@ async def lookup_attacker_ip(ip: str) -> str:
     Returns the full honeypot dossier for an IP present in the event store:
     session/event counts, first/last seen, protocols, a daily timeline,
     credentials attempted (passwords MASKED to '********'), MITRE ATT&CK
-    techniques, the edge nodes that saw it, and recent events. A 404 means the
+    techniques, the cities of the sensors that saw it, and recent events. A 404 means the
     IP has no recorded events.
+
+    For an address with more events than one read takes (the busiest attackers send
+    over 100,000 a day), `total_events_is_minimum` is true: `total_events` is then at
+    least that many, and the protocol and sensor breakdown and `total_sessions`
+    describe only its newest `sampled_events` events.
 
     Args:
         ip: The attacker IP address to look up (e.g. "176.65.139.56")
@@ -590,8 +595,9 @@ async def search_credentials(
     """Search the global captured-credential corpus with PLAINTEXT passwords (paid: credential_intel).
 
     Returns credential records (username, password_hash, password_plain,
-    protocol, source_ip, edge, session, first/last seen, attempt counts) from
-    the shared global dataset. Requires the Credential Intelligence plan
+    protocol, source_ip, source_country, session_id, first/last seen,
+    cross_protocol, attempt_count) from the shared global dataset. Which
+    sensor captured a credential is not returned. Requires the Credential Intelligence plan
     (feature realtime_credential_feed or credential_intel). Plaintext
     is intentionally returned here — it is NOT masked.
 
@@ -650,13 +656,16 @@ async def credential_stats(
 
 @mcp.tool()
 async def list_payloads(sha256: Optional[str] = None, limit: int = 20) -> str:
-    """List captured malware payloads, or fetch one payload's full record by sha256 (Threat Intel Analyst or Pro).
+    """List files attackers delivered to the honeypots, or fetch one file's record by sha256 (Threat Intel Analyst or Pro).
 
-    With no sha256 this lists payload artifacts with summary stats. With a
-    sha256 it returns that artifact's full envelope (artifact + detonation +
-    VirusTotal/MalwareBazaar intel + actor); a live VT/MB lookup runs so an
-    unknown hash still returns a structured record. Reference hashes are
-    discoverable free via recent_iocs ioc_value.
+    With no sha256 this lists the newest captured files (hash, the attacker's
+    file name, download URL, size, type, first and last seen, whether it was
+    detonated) with summary stats. With a sha256 it returns that file's
+    record, the actor where known, and any VirusTotal/MalwareBazaar reputation
+    BlackDome already holds; no outside lookup is made, and a hash that is not
+    a honeypot capture answers 404. Threat Intel Pro also gets the detonation's
+    status, verdict and times; report content is under list_detonations.
+    Reference hashes are discoverable free via recent_iocs ioc_value.
 
     Args:
         sha256: Optional payload sha256 — when given, returns that payload's detail
@@ -757,7 +766,8 @@ async def list_notable_sessions(
     Returns a flat object with count and sessions[]. Each session includes
     session_id, actor_id, ip, geo, command_count, distinct_techniques,
     primary_tactic, persona_stage, persona_score, score, first_ts, last_ts,
-    novelty, dropped_artifact_count, edge_id and human_likely. Use this to
+    novelty, dropped_artifact_count and human_likely (no sensor name; ip is
+    the attacker's public address or null). Use this to
     surface the most interesting hands-on-keyboard intrusions out of botnet
     probe noise. Requires the session_intel feature, which no plan on sale includes.
 
@@ -797,10 +807,12 @@ async def get_session_transcript(
     """Get a structured attacker session transcript (session_intel; no plan on sale includes it).
 
     Returns {session, steps, total_steps, truncated}. The session object includes
-    session_id, actor_id, ip, geo, edge_id, primary_tactic, start_ts, end_ts,
+    session_id, actor_id, ip, geo, primary_tactic, start_ts, end_ts,
     persona_stage, persona_score and dropped_artifacts. Each step includes seq,
     ts, command, output_preview, exit_code, cwd, latency_ms, techniques and
-    guard_triggered. Requires the session_intel feature, which no plan on sale includes.
+    guard_triggered. Names of our sensors, our server paths and our addresses
+    in command, output_preview and cwd read [sensor], [sandbox-path] and
+    [redacted]. Requires the session_intel feature, which no plan on sale includes.
 
     Args:
         session_id: Session id returned by list_notable_sessions
@@ -831,12 +843,15 @@ async def list_detonations(
     """List malware detonation reports with IOC counts and file classification (paid: Pro detonation_intel).
 
     Returns a flat object with count and detonations[]. Each detonation includes
-    detonation_id, sha256, verdict, finished_at, vm_type, magika_label and
-    ioc_count. Requires the detonation_intel feature (Threat Intel Pro).
+    detonation_id, sha256, verdict, finished_at, sandbox_kind
+    (virtual_machine, container, not_run or static_analysis), magika_label and
+    ioc_count. Only files attackers delivered to a BlackDome honeypot are
+    listed. Requires the detonation_intel feature (Threat Intel Pro).
 
     Args:
         verdict: Filter by verdict (e.g. "malware", "benign", "suspicious")
-        vm_type: Filter by sandbox VM type
+        vm_type: Ignored by the service since 2026-11-16 (still accepted and
+            sent, so existing calls keep working). Read sandbox_kind instead.
         sha256: Filter by artifact sha256
         since: ISO timestamp lower bound
         limit: Max detonations to return (default 100, capped at 100)
@@ -861,11 +876,19 @@ async def list_detonations(
 async def get_detonation_report(detonation_id: str) -> str:
     """Get a full malware detonation report (paid: Pro detonation_intel).
 
-    Returns detonation_id, sha256, verdict, started_at, finished_at, metadata,
-    report_available, report_unavailable_reason, report_body, iocs[] and
-    artifact classification fields. report_available=false is returned when a
-    report file is missing, absent or too large. Requires the detonation_intel
-    feature (Threat Intel Pro).
+    Returns detonation_id, sha256, verdict, started_at, finished_at,
+    report_available, report_unavailable_reason, report, iocs[] and artifact
+    classification fields. report is what the file did, as a fixed set of
+    fields: status, verdict, risk_score, reason_codes, verdicts (heuristic,
+    model), file (hashes, size, type), archive (members), static (format,
+    markers), sandbox (kind, executed, timed_out, exit_code, skip_reason),
+    behaviour (processes_started, files_created, files_deleted,
+    network_connections, dns_lookups, downloads, persistence,
+    suspicious_behaviors, syscall_counts) and findings. Names of our sensors,
+    the sample's own file name, our server paths and our addresses read
+    [sensor], [sample], [sandbox-path] and [redacted]. report is null and
+    report_available false when no report could be built. Requires the
+    detonation_intel feature (Threat Intel Pro).
 
     Args:
         detonation_id: Detonation id returned by list_detonations
@@ -884,7 +907,8 @@ async def get_artifact(sha256: str) -> str:
     """Get an artifact dossier with linked detonation, IOCs and session reference (paid: Pro detonation_intel).
 
     Returns artifact classification fields, linked detonation summary, iocs[],
-    and dropped_by_session identifiers/counts only. It does not request or
+    and dropped_by_session identifiers/counts only (null unless the file came
+    from a honeypot session of an attacker). It does not request or
     return transcript command text or output_preview fields. Requires the
     detonation_intel feature (Threat Intel Pro).
 

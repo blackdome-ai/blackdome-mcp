@@ -4,7 +4,7 @@
 
 Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
-Package version: `0.5.1`
+Package version: `0.5.2`
 
 Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
 
@@ -116,7 +116,7 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 
 | Tool | Tier | Description |
 |------|------|-------------|
-| `lookup_attacker_ip` | **Free** | Full dossier for one attacker IP — events, protocols, credentials (passwords masked), MITRE, edge nodes |
+| `lookup_attacker_ip` | **Free** | Full dossier for one attacker IP — events, protocols, credentials (passwords masked), MITRE, the cities of the sensors that saw it |
 | `top_attackers` | **Free** | Most active attacker IPs over a window — pick one to drill into |
 | `attack_map` | **Free** | Recent geolocated attack events for a live map (limit ≥ 10) |
 | `attack_heatmap` | **Free** | Country-aggregated attack heatmap with centroids (limit ≥ 5) |
@@ -127,7 +127,7 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `export_iocs` | **Free** (json/csv) · **Pro** (stix) | Export the IOC feed; STIX bundle needs the `stix_export` feature |
 | `search_credentials` | **Credential Intelligence** (`credential_intel` or `realtime_credential_feed`) | Search the global credential corpus with PLAINTEXT passwords |
 | `credential_stats` | **Credential Intelligence** (`credential_intel` or `realtime_credential_feed`) | Aggregate credential stats — top usernames/passwords, breakdowns |
-| `list_payloads` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List captured malware payloads, or fetch one by sha256 (VT/MB intel) |
+| `list_payloads` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List files attackers delivered to the honeypots, or fetch one by sha256 (reputation already held; Pro adds detonation status and verdict) |
 | `get_actor` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List clustered threat actors, or fetch one actor's sessions |
 | `warboard` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | Sigil leaderboard with intrusion narratives + attacker command tails |
 | `list_notable_sessions` | **Not on sale** (`session_intel`; no plan on sale includes it) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
@@ -181,7 +181,7 @@ The package runs locally over stdio; the separately hosted streamable-HTTP endpo
 
 ## Rate Limits
 
-Without an API key, the indicator export (`export_iocs`) is capped at about **30 requests a minute** and **100 a day**. With a key the limits are your plan's: BlackDome Free 60 a minute and 100 a day; Threat Intel Analyst 60 a minute and 200 a day; Threat Intel Pro, Credential Intelligence and ThreatDrop API 300 a minute and 5,000 a day. `whoami` returns the limits of your key. Indicators are **72 hours behind live** without a key and on BlackDome Free; Threat Intel Analyst, Threat Intel Pro and Credential Intelligence get the feed without that delay through `export_iocs`. `recent_iocs` and `ioc_trends` are the public preview and are always 72 hours behind. Enterprise: talk to us (sales@blackdome.ai). When you hit a limit the server returns a `429` error that names the limit of your plan.
+Without an API key, the indicator export (`export_iocs`) is capped at about **30 requests a minute** and **100 a day**. With a key the limits are your plan's: BlackDome Free 60 a minute and 100 a day; Threat Intel Analyst 60 a minute and 5,000 a day; Threat Intel Pro 300 a minute and 50,000 a day; Credential Intelligence and ThreatDrop API 300 a minute and 5,000 a day. `whoami` returns the limits of your key. Indicators are **72 hours behind live** without a key and on BlackDome Free; Threat Intel Analyst, Threat Intel Pro and Credential Intelligence get the feed without that delay through `export_iocs`. `recent_iocs` and `ioc_trends` are the public preview and are always 72 hours behind. Enterprise: talk to us (sales@blackdome.ai). When you hit a limit the server returns a `429` error that names the limit of your plan.
 
 ## Troubleshooting
 

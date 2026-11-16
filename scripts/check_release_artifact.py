@@ -18,7 +18,7 @@ from typing import Sequence
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.5.1"
+RELEASE_VERSION = "0.5.2"
 PACKAGE_NAME = "blackdome-mcp"
 EXPECTED_TOOLS = (
     "lookup_attacker_ip",
@@ -231,7 +231,7 @@ from pathlib import Path
 import sys
 import httpx
 
-assert metadata.version("blackdome-mcp") == "0.5.1"
+assert metadata.version("blackdome-mcp") == "0.5.2"
 console_scripts = {
     entry.name: entry.value
     for entry in metadata.distribution("blackdome-mcp").entry_points

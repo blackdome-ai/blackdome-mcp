@@ -160,7 +160,7 @@ def test_installed_stdio_all_tools(mode, tmp_path):
                 async with stdio_client(params, errlog=stderr) as (read, write):
                     async with ClientSession(read, write) as client:
                         initialized = await client.initialize()
-                        assert initialized.serverInfo.version == "0.5.1"
+                        assert initialized.serverInfo.version == "0.5.2"
                         listed = await client.list_tools()
                         assert {t.name for t in listed.tools} == {case[0] for case in CASES}
                         assert len(listed.tools) == 31

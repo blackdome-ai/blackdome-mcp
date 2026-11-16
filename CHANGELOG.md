@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.5.2 - 2026-11-17
+
+- No tool was added, removed or renamed, and no request sent to the service
+  changed. Tool descriptions follow what the service returns since 2026-11-16
+  and 2026-11-17.
+- `lookup_attacker_ip`: the service answers for the busiest attackers again (it
+  used to time out on them). For such an address the answer carries
+  `total_events_is_minimum: true` and `sampled_events`: the total is then a
+  lower bound, and the protocol and sensor breakdown describe its newest events.
+- Sessions: the service records honeypot sessions again since 2026-11-17, from
+  the first command an attacker types or the first file dropped. There are none
+  for 2026-10-12 to 2026-11-16. An actor id of a session recorded since then
+  stands for one attacker address. This is what `get_actor` (sessions) and the
+  session tools return; the tools themselves are unchanged.
+- `lookup_attacker_ip`: the API now names the city of each sensor that saw the
+  address (as on blackdome.ai/sensors), not the sensor's internal name.
+- Detonation tools describe the new report shape. `get_detonation_report`
+  returns `report` (a fixed set of fields: what the file did) instead of
+  `metadata` and `report_body`; names of our sensors, server paths and
+  addresses read `[sensor]`, `[sandbox-path]` and `[redacted]`.
+  `list_detonations` returns `sandbox_kind` instead of `vm_type`; its
+  `vm_type` argument is still sent, but the service ignores it. Only
+  docstrings changed; no request changed.
+- `credential_search`: credential records no longer carry `edge_id` (the
+  sensor that captured them).
+- `list_notable_sessions` and `get_session_transcript`: no `edge_id`; `ip` is
+  the attacker's public address or null; transcript text has our sensor
+  names, server paths and addresses replaced.
+- Indicator tags and STIX labels no longer include `edge:<sensor>` or any
+  other tag that names a sensor, job, run, capture or path.
+- `list_payloads` now describes what the API returns since 2026-11-16: the shared
+  honeypot corpus (it returned an empty list for every customer before), no
+  outside reputation lookup, 404 for a hash that is not a honeypot capture, and
+  detonation status and verdict on Threat Intel Pro only.
+- Rate limits in the README: Threat Intel Analyst 5,000 requests a day, Threat
+  Intel Pro 50,000.
+
 ## 0.5.1 - 2026-11-16
 
 - No tool was added, removed or renamed, and no request sent to the service
