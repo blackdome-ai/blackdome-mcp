@@ -18,7 +18,7 @@ from typing import Sequence
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.5.2"
+RELEASE_VERSION = "0.5.3"
 PACKAGE_NAME = "blackdome-mcp"
 EXPECTED_TOOLS = (
     "lookup_attacker_ip",
@@ -34,7 +34,6 @@ EXPECTED_TOOLS = (
     "credential_stats",
     "list_payloads",
     "get_actor",
-    "warboard",
     "list_notable_sessions",
     "get_session_transcript",
     "list_detonations",
@@ -120,6 +119,7 @@ def _assert_wheel(wheel: Path) -> None:
         "blackdome_mcp/__init__.py",
         "blackdome_mcp/server.py",
         "blackdome_mcp/http_server.py",
+        "blackdome_mcp/plans.py",
         "blackdome_mcp-{version}.dist-info/METADATA".format(version=RELEASE_VERSION),
         "blackdome_mcp-{version}.dist-info/entry_points.txt".format(version=RELEASE_VERSION),
     }
@@ -161,6 +161,7 @@ def _assert_sdist(sdist: Path) -> None:
         "{root}/src/blackdome_mcp/__init__.py".format(root=root),
         "{root}/src/blackdome_mcp/server.py".format(root=root),
         "{root}/src/blackdome_mcp/http_server.py".format(root=root),
+        "{root}/src/blackdome_mcp/plans.py".format(root=root),
     }
     with tarfile.open(sdist, "r:gz") as archive:
         names = set(archive.getnames())
@@ -231,7 +232,7 @@ from pathlib import Path
 import sys
 import httpx
 
-assert metadata.version("blackdome-mcp") == "0.5.2"
+assert metadata.version("blackdome-mcp") == "0.5.3"
 console_scripts = {
     entry.name: entry.value
     for entry in metadata.distribution("blackdome-mcp").entry_points
@@ -247,8 +248,7 @@ assert callable(http_server.main)
 tools = asyncio.run(server.mcp.list_tools())
 names = tuple(tool.name for tool in tools)
 assert names == __EXPECTED_TOOLS__
-assert len(names) == 31
-assert len(set(names)) == 31
+assert len(set(names)) == len(names)
 assert callable(http_server.create_http_app())
 
 class LifespanDriver:

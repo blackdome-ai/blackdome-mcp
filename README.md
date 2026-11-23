@@ -4,7 +4,9 @@
 
 Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
-Package version: `0.5.2`
+The old registry name `io.github.blackdome-ai/blackdome` is deprecated. Use `io.github.blackdome-ai/blackdome-mcp`.
+
+Package version: `0.5.3`
 
 Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
 
@@ -14,13 +16,15 @@ Community tools are **free and need no API key**. The tool table identifies the 
 
 ### Option 1 — Separately hosted streamable-HTTP MCP (recommended, no install)
 
-One hosted streamable-HTTP endpoint for compatible remote MCP clients (Claude Desktop, the claude.ai web app, mobile, Cursor):
+One hosted streamable-HTTP endpoint for remote MCP clients that can send a header (Claude Code with `--header`, Cursor with `"headers"`):
 
 ```
 https://api.blackdome.ai/mcp
 ```
 
-Free tools work with no key. To unlock the paid tiers (credential intelligence, payloads, actors, warboard, STIX export), get an API key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)** and add it as an `Authorization` header:
+A custom connector in Claude (claude.ai, Claude Desktop, mobile) is added with this URL and "No sign in", and gives the free tools only: the server has no sign-in (OAuth) flow, and a connector sends no key header. To use a key in Claude Desktop, run the package locally (Option 2).
+
+Free tools work with no key. To unlock the paid tiers (credential intelligence, payloads, actors, evidence records, STIX export), get an API key at **[https://blackdome.ai/pricing](https://blackdome.ai/pricing)** and add it as an `Authorization` header:
 
 ```json
 {
@@ -99,12 +103,14 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per project):
 
 ## API Key Behavior
 
-- **No key:** free community tools work; paid tools return an explicit `401`.
-- **Invalid key:** paid tools (and `whoami`) fail loudly with `401 Invalid API key` — there is **no silent fallback** to free-tier results. Free tools keep working regardless of key validity, except `export_iocs`, which refuses a bad key with `401` instead of treating the call as keyless.
+Every refusal is a failed tool call (`isError: true`) with one sentence that names the plan which includes the tool, its price and https://blackdome.ai/pricing.
+
+- **No key:** free community tools work; every other tool is refused and told which plan opens it.
+- **Invalid key:** every tool, the free ones included, is refused (`401`): a key that is sent is checked first, and a wrong, revoked or deleted key never quietly gets free-tier results. Remove the key to use the free tools.
 - **Expired key:** `403 API key has expired`.
 - **Cancelled, lapsed or unpaid plan:** the account continues as BlackDome Free, so a paid tool returns an explicit `403` and the free tools keep working.
 - **Suspended account:** `403 Tenant account is inactive`.
-- **Valid key, wrong plan:** a tool your plan does not include returns an explicit `403`; check your plan and its features any time with `whoami`. A feature name alone does not settle it: `api_access` on a ThreatDrop API or Credential Intelligence key covers that product's own endpoints, while payloads, actors, the warboard and explanations also need a Threat Intel plan (Analyst or Pro).
+- **Valid key, wrong plan:** a tool your plan does not include returns an explicit `403`; check your plan and its features any time with `whoami`. A feature name alone does not settle it: `api_access` on a ThreatDrop API or Credential Intelligence key covers that product's own endpoints, while payloads, actors and evidence records also need a Threat Intel plan (Analyst or Pro).
 - **Key without the `read` scope:** gated tools return `403`.
 - **A key on a plan without the indicator feed** (ThreatDrop API only): `export_iocs` returns `403`. Call it without a key for the keyless export.
 
@@ -129,13 +135,12 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `credential_stats` | **Credential Intelligence** (`credential_intel` or `realtime_credential_feed`) | Aggregate credential stats — top usernames/passwords, breakdowns |
 | `list_payloads` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List files attackers delivered to the honeypots, or fetch one by sha256 (reputation already held; Pro adds detonation status and verdict) |
 | `get_actor` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | List clustered threat actors, or fetch one actor's sessions |
-| `warboard` | **Analyst or Pro** (`api_access` on a Threat Intel plan) | Sigil leaderboard with intrusion narratives + attacker command tails |
-| `list_notable_sessions` | **Not on sale** (`session_intel`; no plan on sale includes it) | Ranked hand-keyed attacker sessions surfaced out of botnet noise |
+| `list_notable_sessions` | **Analyst or Pro** | Summaries of notable honeypot sessions |
 | `get_session_transcript` | **Not on sale** (`session_intel`; no plan on sale includes it) | Structured command/output transcript for one attacker session |
 | `list_detonations` | **Pro** (`detonation_intel`) | Malware detonation list with verdicts, Magika labels and IOC counts |
 | `get_detonation_report` | **Pro** (`detonation_intel`) | Full detonation report with behavior, IOCs, artifact classification and report availability |
 | `get_artifact` | **Pro** (`detonation_intel`) | Artifact dossier with linked detonation, IOCs and session identifiers only |
-| `explain_ioc` | **Analyst or Pro** (`ioc_explanation`) | Observed evidence for an IP, domain, or URL |
+| `explain_ioc` | **Analyst or Pro** (`ioc_explanation`) | An evidence record for indicators in our malware graph: where and when we saw it, and what it links to |
 | `compare_samples` | **Pro** (`sample_compare`) | Deterministic comparison of two SHA-256 samples |
 | `get_evidence_cluster` | **Pro** (`genome_clusters`) | Bounded evidence cluster for a SHA-256, IP, domain, or URL |
 | `get_reproducible_novelty` | **Pro** (`reproducible_novelty`) | Reproducible behavior assessment for a SHA-256, IP, domain, or URL |
@@ -163,7 +168,7 @@ Once connected, try asking your AI assistant:
 - *"What plan am I on and which features do I have?"* (runs `whoami`)
 - *"Search captured SSH credentials for the username root."* (paid)
 - *"Pull the detonation report for sha256 a6713518f2e26745683d33ded61b465d0645d7af850464c559fba8bb84e68398."* (Pro)
-- *"Explain the observed evidence for domain example.test."* (Analyst or Pro)
+- *"Show the evidence record for domain example.test."* (Analyst or Pro)
 - *"Compare these two SHA-256 samples deterministically."* (Pro)
 - *"Show the bounded evidence cluster for this IOC."* (Pro)
 - *"What reproducible novelty does this URL show?"* (Pro)
@@ -176,8 +181,8 @@ The package runs locally over stdio; the separately hosted streamable-HTTP endpo
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BLACKDOME_API_KEY` | No | — | Bearer API key. Free tools work without it; paid tools require it |
-| `BLACKDOME_BASE_URL` | No | `https://api.blackdome.ai` | API base URL |
-| `BLACKDOME_TIMEOUT` | No | `15` | Request timeout in seconds |
+| `BLACKDOME_BASE_URL` | No | `https://api.blackdome.ai` (the hosted entry point `blackdome-mcp-http`: `http://127.0.0.1:7860`, the API on the same machine; set `https://api.blackdome.ai` if you run it yourself) | API base URL |
+| `BLACKDOME_TIMEOUT` | No | `45` | Seconds to wait for one API answer |
 
 ## Rate Limits
 
