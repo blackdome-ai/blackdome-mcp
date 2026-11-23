@@ -6,17 +6,20 @@ threat actors, and a global attack map sourced from the BlackDome edge fleet.
 
 Community tools are FREE and work with NO API key.
 Additional intelligence (credential search, payloads, actors,
-warboard, STIX export) requires an API key tied to a paid plan. Get a key at
+evidence records, STIX export) requires an API key tied to a paid plan. Get a key at
 https://blackdome.ai/pricing.
 
 Authenticates against the BlackDome API with a Bearer token when one is set.
 """
 
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import sys
+import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import quote, urlsplit
@@ -24,7 +27,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from blackdome_mcp import __version__
+from blackdome_mcp import __version__, plans
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,7 +39,13 @@ API_KEY = os.environ.get("BLACKDOME_API_KEY", "")
 BASE_URL = os.environ.get(
     "BLACKDOME_BASE_URL", "https://api.blackdome.ai"
 ).rstrip("/")
-TIMEOUT = int(os.environ.get("BLACKDOME_TIMEOUT", "15"))
+# Seconds to wait for one BlackDome API answer. 45 (2026-11-21, full test 04 finding 2): the slowest API calls took
+# 12-31 s cold (attack_map, list_notable_sessions, credential_stats) and failed at the old 15. 45 stays under the
+# 60 s nginx gives a call through the public API host (proxy_read_timeout default on api.blackdome.ai
+# /api/v1/blackdome/), which a stdio install goes through. The hosted server calls the API on loopback (no proxy
+# between them, see http_server.HOSTED_BASE_URL); what bounds it there is the hosted /mcp location's 600 s
+# proxy_read_timeout in front of this server, far above 45.
+TIMEOUT = int(os.environ.get("BLACKDOME_TIMEOUT", "45"))
 
 # Hosted (streamable-HTTP) deployments serve many customers from one process:
 # each request's Authorization/X-API-Key header is captured into this var by
@@ -50,8 +59,52 @@ def set_request_api_key(key: str) -> Any:
     return _REQUEST_API_KEY.set(key or "")
 
 
+def key_from_headers(pairs: Any) -> str:
+    """The API key a request carries: ``Authorization: Bearer <key>`` (or a bare value), else ``X-API-Key``.
+
+    ``pairs`` is a list of (name, value) as ASGI gives them (bytes) or as strings."""
+    authorization = ""
+    x_api_key = ""
+    for raw_name, raw_value in pairs or []:
+        name = raw_name.decode("latin-1") if isinstance(raw_name, bytes) else str(raw_name)
+        value = raw_value.decode("latin-1") if isinstance(raw_value, bytes) else str(raw_value)
+        name, value = name.lower(), value.strip()
+        if name == "authorization":
+            authorization = value
+        elif name == "x-api-key":
+            x_api_key = value
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    if authorization:
+        return authorization
+    return x_api_key
+
+
+def _key_of_this_http_request() -> Optional[str]:
+    """Hosted mode: the key on the HTTP request that carried THIS tool call ("" when it carried none).
+
+    None outside an HTTP request (stdio). The SDK's request context names the very request: in a stateful
+    session the tool runs in the session's own task, which keeps the context of the request that opened the
+    session (initialize), so a contextvar set per request is not seen there (sweep 2026-11-21: a call made
+    with key B was sent upstream with the initialize request's key A)."""
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = getattr(request_ctx.get(), "request", None)
+    except Exception:
+        return None
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict) or scope.get("type") != "http":
+        return None
+    return key_from_headers(scope.get("headers"))
+
+
 def current_api_key() -> str:
-    """Per-request key (hosted mode) falling back to the env-var key (stdio)."""
+    """Hosted mode: the key of the request that carried this call, and nothing else (no remembered key and
+    no process key). Stdio: the per-request contextvar, else the env-var key."""
+    per_request = _key_of_this_http_request()
+    if per_request is not None:
+        return per_request
     return _REQUEST_API_KEY.get() or API_KEY
 
 mcp = FastMCP(
@@ -62,13 +115,180 @@ mcp = FastMCP(
         "attacker IPs, browse indicators of compromise (IOCs), inspect captured "
         "credentials and malware payloads, profile threat actors, and render a "
         "real-time global attack map. Free public tools require no API key; "
-        "credential, payload, actor, warboard and STIX-export tools require a "
+        "credential, payload, actor, evidence-record and STIX-export tools require a "
         "paid plan key. The specimen catalogue tools need Threat Intel Pro "
         "(feature genome_clusters) and never return sample files. "
         "Captured passwords from the free attacker lookup are masked; the paid "
         "credential tools return the full intelligence."
     ),
 )
+# ---------------------------------------------------------------------------
+# The daily request limit, passed on to the client (2026-11-21)
+# ---------------------------------------------------------------------------
+#
+# Every BlackDome API answer to a keyed request carries the key's DAILY limit as RateLimit-Limit,
+# RateLimit-Remaining and RateLimit-Reset (seconds to 00:00 UTC), plus its RateLimit-Policy. A daily
+# 429 says so in one sentence ("Daily request limit reached: <plan> allows <n> requests a day."). The MCP server
+# passes them on in two ways:
+#   - in every tool result, a short note when the limit is near (at most a tenth of it left) or reached, with
+#     the numbers in the note's _meta under "blackdome.ai/daily_limit";
+#   - on the hosted HTTP transport, the same four headers on the HTTP answer to the tool call
+#     (blackdome_mcp.http_server.LimitHeaders).
+
+LIMIT_HEADERS = ("RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset", "RateLimit-Policy")
+LIMIT_META_KEY = "blackdome.ai/daily_limit"
+# Where the hosted transport's middleware leaves a dict for this HTTP request's limit (scope["state"][...]).
+LIMIT_STATE_KEY = "blackdome_daily_limit"
+# The limit seen during the current tool call (set by _call_tool_with_limit_note).
+_CALL_LIMIT: ContextVar[Optional[dict]] = ContextVar("blackdome_mcp_call_limit", default=None)
+
+
+def _limit_from_response(resp: Any) -> Optional[dict]:
+    """The daily limit an API answer states, or None when it states none (a keyless or public answer)."""
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    values = {name: str(headers.get(name, "")).strip() for name in LIMIT_HEADERS}
+    if not values["RateLimit-Limit"].isdigit() or not values["RateLimit-Remaining"].isdigit():
+        return None
+    info: dict[str, Any] = {"headers": {k: v for k, v in values.items() if v}}
+    info["limit"] = int(values["RateLimit-Limit"])
+    info["remaining"] = int(values["RateLimit-Remaining"])
+    info["reset_seconds"] = int(values["RateLimit-Reset"]) if values["RateLimit-Reset"].isdigit() else None
+    if getattr(resp, "status_code", 200) == 429 and info["remaining"] == 0:
+        try:
+            detail = resp.json().get("detail")
+        except Exception:
+            detail = None
+        info["detail"] = " ".join(str(detail).split())[:300] if detail else None
+    return info
+
+
+def _keep_lowest(holder: Optional[dict], info: dict) -> None:
+    if holder is None:
+        return
+    current = holder.get("info")
+    if current is None or info["remaining"] <= current["remaining"] or info.get("detail"):
+        holder["info"] = info
+
+
+def _request_limit_holder() -> Optional[dict]:
+    """The hosted transport's dict for this HTTP request (via the SDK's request context), else None."""
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = getattr(request_ctx.get(), "request", None)
+        state = getattr(request, "scope", {}).get("state") if request is not None else None
+        holder = state.get(LIMIT_STATE_KEY) if isinstance(state, dict) else None
+        return holder if isinstance(holder, dict) else None
+    except Exception:
+        return None
+
+
+def _record_limit(resp: Any) -> None:
+    """Note the daily limit an API answer states, for the tool result and the hosted HTTP answer."""
+    info = _limit_from_response(resp)
+    if info is None:
+        return
+    _keep_lowest(_CALL_LIMIT.get(), info)
+    _keep_lowest(_request_limit_holder(), info)
+
+
+def _limit_note_text(info: dict) -> Optional[str]:
+    limit, remaining = info["limit"], info["remaining"]
+    reset = info.get("reset_seconds")
+    when = "The count starts again at 00:00 UTC"
+    if reset is not None:
+        hours, minutes = divmod(max(0, reset) // 60, 60)
+        when += f" (in {hours} h {minutes} min)"
+    if remaining <= 0:
+        who = "this key allows" if current_api_key() else "use without an account allows"
+        sentence = info.get("detail") or f"Daily request limit reached: {who} {limit} requests a day."
+        return f"{sentence} {when}."
+    if remaining <= max(1, limit // 10):
+        return f"Daily request limit nearly reached: {remaining} of {limit} requests left today. {when}."
+    return None
+
+
+def _limit_note(info: Optional[dict]) -> Any:
+    """The note for a tool result, or None when the limit is not near."""
+    if not info:
+        return None
+    text = _limit_note_text(info)
+    if text is None:
+        return None
+    from mcp.types import TextContent
+
+    meta = {
+        "state": "reached" if info["remaining"] <= 0 else "near",
+        "limit": info["limit"],
+        "remaining": info["remaining"],
+        "reset_seconds": info.get("reset_seconds"),
+    }
+    return TextContent(type="text", text=text, _meta={LIMIT_META_KEY: meta})
+
+
+def _with_limit_note(result: Any, info: Optional[dict]) -> Any:
+    note = _limit_note(info)
+    if note is None:
+        return result
+    from mcp.types import CallToolResult, TextContent
+
+    if isinstance(result, CallToolResult):
+        return result.model_copy(update={"content": [*result.content, note]})
+    if isinstance(result, tuple) and len(result) == 2:
+        return [*result[0], note], result[1]
+    if isinstance(result, dict):
+        return [TextContent(type="text", text=json.dumps(result, indent=2)), note], result
+    return [*result, note]
+
+
+# A tool that refuses or fails returns its sentence through _fail(), which marks the current call as failed; the
+# tools/call handler then answers with isError true (2026-11-21, full test 04 finding 5: every refusal, upstream
+# error and timeout came back as a successful result). A tool called directly (tests) still returns the sentence.
+_CALL_FAILED: ContextVar[Optional[dict]] = ContextVar("blackdome_mcp_call_failed", default=None)
+
+
+def _fail(text: str) -> str:
+    """The sentence of a refusal or failure, with the current tool call marked as failed (isError true)."""
+    state = _CALL_FAILED.get()
+    if state is not None:
+        state["failed"] = True
+    return text
+
+
+def _as_error_result(result: Any) -> Any:
+    from mcp.types import CallToolResult, TextContent
+
+    if isinstance(result, CallToolResult):
+        return result.model_copy(update={"isError": True})
+    structured = None
+    if isinstance(result, tuple) and len(result) == 2:
+        content, structured = list(result[0]), result[1]
+    elif isinstance(result, dict):
+        content, structured = [TextContent(type="text", text=json.dumps(result, indent=2))], result
+    else:
+        content = list(result)
+    return CallToolResult(content=content, structuredContent=structured, isError=True)
+
+
+async def _call_tool_with_limit_note(name: str, arguments: dict[str, Any]) -> Any:
+    holder: dict = {}
+    failed: dict = {}
+    token = _CALL_LIMIT.set(holder)
+    failed_token = _CALL_FAILED.set(failed)
+    try:
+        result = await FastMCP.call_tool(mcp, name, arguments)
+    finally:
+        _CALL_FAILED.reset(failed_token)
+        _CALL_LIMIT.reset(token)
+    result = _with_limit_note(result, holder.get("info"))
+    return _as_error_result(result) if failed.get("failed") else result
+
+
+# Replaces FastMCP's own tools/call handler (registered in its constructor) with the same call plus the note.
+mcp._mcp_server.call_tool(validate_input=False)(_call_tool_with_limit_note)
+
 # FastMCP 1.x does not expose a product-version constructor argument; its
 # protocol server reads this value into initialize.serverInfo.version.
 mcp._mcp_server.version = __version__
@@ -90,7 +310,121 @@ def _headers() -> dict[str, str]:
     key = current_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    client_address = _client_address_from_nginx()
+    if client_address and _base_url_is_loopback():
+        headers["X-Real-IP"] = client_address
     return headers
+
+
+def _base_url_is_loopback() -> bool:
+    try:
+        return ipaddress.ip_address(urlsplit(BASE_URL).hostname or "").is_loopback
+    except ValueError:
+        return (urlsplit(BASE_URL).hostname or "").lower() == "localhost"
+
+
+def _client_address_from_nginx() -> Optional[str]:
+    """Hosted mode: the MCP client's own address as nginx gave it on this request (X-Real-IP), else None.
+
+    The hosted server listens on 127.0.0.1 behind nginx, whose /mcp location sets X-Real-IP to the connection's
+    address. That address is passed to the API, so a keyless caller is counted as itself and not in one bucket
+    with every other keyless MCP user. It is sent only when the API is called on a loopback address
+    (BLACKDOME_BASE_URL such as http://127.0.0.1:7860): through the public address nginx replaces it with this
+    server's own address anyway. Taken only from a loopback peer (or the peer uvicorn took from nginx's
+    X-Forwarded-For, which nginx sets from the same address)."""
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = getattr(request_ctx.get(), "request", None)
+    except Exception:
+        return None
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict) or scope.get("type") != "http":
+        return None
+    real_ip = ""
+    for raw_name, raw_value in scope.get("headers") or []:
+        if bytes(raw_name).lower() == b"x-real-ip":
+            real_ip = bytes(raw_value).decode("latin-1").strip()
+    try:
+        address = ipaddress.ip_address(real_ip)
+        peer_host = (scope.get("client") or ("",))[0] or ""
+        peer = ipaddress.ip_address(peer_host)
+    except ValueError:
+        return None
+    if address.is_loopback or not (peer.is_loopback or peer == address):
+        return None
+    return str(address)
+
+
+class _KeyNotAccepted(Exception):
+    """The caller sent an API key that the BlackDome API does not accept (checked before a free public route)."""
+
+
+# A wrong key must be refused, never quietly served the free data (2026-11-21, full test 04 finding 9, item D5).
+# The free tools' public routes (/api/blackdome/...) do not reject a bad key; they answer as for no key. So when a
+# key is sent, it is first checked once on /api/v1/blackdome/me (which 401s a key it does not accept). /me counts
+# as a request on the key's daily total, so the outcome is remembered per key digest (never the key itself) for
+# _KEY_CHECK_TTL seconds, at most _KEY_CHECK_MAX keys. Only a 401 refuses: any other answer (403, 429, 5xx, a
+# timeout) says nothing about the key being wrong, and the call goes ahead as before.
+_KEY_CHECK_TTL = 600.0
+_KEY_CHECK_MAX = 4096
+_KEY_CHECKS: "OrderedDict[str, tuple[float, bool]]" = OrderedDict()
+_PUBLIC_ROUTE_PREFIX = "/api/blackdome/"
+
+
+async def _require_accepted_key() -> None:
+    key = current_api_key()
+    if not key:
+        return
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    seen = _KEY_CHECKS.get(digest)
+    if seen is not None and now - seen[0] < _KEY_CHECK_TTL:
+        accepted = seen[1]
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                resp = await client.get(f"{BASE_URL}/api/v1/blackdome/me", headers=_headers())
+        except httpx.HTTPError:
+            return
+        _record_limit(resp)
+        accepted = resp.status_code != 401
+        _KEY_CHECKS[digest] = (now, accepted)
+        _KEY_CHECKS.move_to_end(digest)
+        while len(_KEY_CHECKS) > _KEY_CHECK_MAX:
+            _KEY_CHECKS.popitem(last=False)
+    if not accepted:
+        raise _KeyNotAccepted()
+
+
+# Every path a tool calls (2026-11-21, item D6). The hosted server calls the API on loopback (http://127.0.0.1:7860),
+# where nginx's allowlist for api.blackdome.ai does not stand in front of it, so the tools hold the same allowlist:
+# a path is a fixed string, or a fixed string with one caller value that _path_segment checked (letters, digits,
+# ".", "_", "-" and ":"; never "", "." or ".."; never "/", "?", "#" or "%"). _api_path refuses anything else before
+# any request is made. These are exactly the locations api.blackdome.ai exposes (nginx: ^~ /api/v1/blackdome/ and
+# ~ ^/api/blackdome/(lookup|top-attackers|map|credentials/preview|audit|iocs)(/|$)), so the loopback API is
+# asked for nothing the public host would not pass.
+_ALLOWED_PATH_RE = re.compile(
+    r"^(?:/api/v1/blackdome/|/api/blackdome/(?:lookup|top-attackers|map|credentials/preview|audit|iocs)(?:/|$))"
+)
+_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_ENCODED_SEGMENT_RE = re.compile(r"^(?:[A-Za-z0-9._-]|%3A)+$")
+
+
+def _path_segment(value: object) -> str:
+    """One caller value placed in a path (an id, a sha256, an IP), percent-encoded; refused unless it is plain."""
+    if type(value) is not str or not _PATH_SEGMENT_RE.fullmatch(value):
+        raise _CustomerIntelligenceValidationError
+    return quote(value, safe="")
+
+
+def _api_path(path: str) -> str:
+    """``path`` if the tools may call it, else refused (no request is made)."""
+    segments = path.split("/")[1:]
+    if (not _ALLOWED_PATH_RE.match(path)
+            or any(not _ENCODED_SEGMENT_RE.fullmatch(segment) or segment.startswith(".") for segment in segments)):
+        raise _CustomerIntelligenceValidationError
+    return path
 
 
 async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -100,12 +434,16 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     return the body as-is — a legitimate top-level "data" field (e.g. on some
     feeds) must not be silently unwrapped.
     """
+    path = _api_path(path)
+    if path.startswith(_PUBLIC_ROUTE_PREFIX):
+        await _require_accepted_key()
     url = f"{BASE_URL}{path}"
     # Strip None values from params
     if params:
         params = {k: v for k, v in params.items() if v is not None}
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         resp = await client.get(url, headers=_headers(), params=params)
+        _record_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -115,7 +453,8 @@ async def _post(path: str, body: dict[str, Any]) -> Any:
     headers = _headers()
     headers["Content-Type"] = "application/json"
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.post(f"{BASE_URL}{path}", headers=headers, json=body)
+        resp = await client.post(f"{BASE_URL}{_api_path(path)}", headers=headers, json=body)
+        _record_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
@@ -126,25 +465,57 @@ def _retry_hint(response: httpx.Response) -> str:
     return f" Retry after {retry} seconds." if retry.isdigit() else ""
 
 
-def _denied_reason(detail: str) -> str:
-    """Why a 403 was returned, in plain words: an expired key or an inactive account is not a plan problem."""
+def _hosted() -> bool:
+    """True inside a hosted (streamable-HTTP) request, False in stdio."""
+    return _key_of_this_http_request() is not None
+
+
+def _not_a_plan_problem(detail: str) -> Optional[str]:
+    """A 403 that a plan does not cure (expired key, inactive account, missing scope), in plain words, else None."""
     lowered = detail.lower()
     if "expired" in lowered:
         return "this API key has expired. Create a new key in your BlackDome dashboard."
+    if "subscription inactive" in lowered:
+        return "the subscription on this key's account is not active. Check billing in your BlackDome dashboard."
     if "inactive" in lowered:
         return "this BlackDome account is inactive."
     if "scope" in lowered:
         return "this API key does not have the scope this tool needs (most tools need `read`)."
-    return (
-        "your plan does not include the feature this tool needs. Payloads, actors, the "
-        "warboard and indicator explanations need Threat Intel Analyst or Pro; credential "
-        "search and stats need the Credential Intelligence plan; detonation intel, the "
-        "specimen catalogue, sample comparison and STIX export need Threat Intel Pro. "
-        "See https://blackdome.ai/pricing."
-    )
+    return None
 
 
-def _format_error(exc: Exception) -> str:
+def _denied_reason(detail: str, tool: str) -> str:
+    """Why a 403 was returned: an expired key or an inactive account is not a plan problem; otherwise the plan
+    that opens this tool and its price (blackdome_mcp.plans)."""
+    return _not_a_plan_problem(detail) or plans.refusal(tool, "plan", hosted=_hosted())
+
+
+def _unauthenticated(tool: str) -> str:
+    """The 401 sentence: no key sent, or a key the service did not accept, and the plan that opens the tool."""
+    situation = "bad_key" if current_api_key() else "no_key"
+    return "Authentication failed (401): " + plans.refusal(tool, situation, hosted=_hosted())
+
+
+def _transport_failure(exc: Exception) -> Optional[str]:
+    """What went wrong when no usable answer came back (a timeout, no connection, an unreadable body), else None."""
+    if isinstance(exc, httpx.TimeoutException):
+        return f"The BlackDome API did not answer within {TIMEOUT} seconds. Try again."
+    if isinstance(exc, httpx.TransportError):
+        return "The BlackDome API could not be reached. Try again."
+    if isinstance(exc, ValueError):   # json.JSONDecodeError: a body that is not the JSON the API sends
+        return "The BlackDome API sent an answer that could not be read. Try again."
+    return None
+
+
+def _format_error(exc: Exception, tool: str) -> str:
+    return _fail(_format_error_text(exc, tool))
+
+
+def _format_error_text(exc: Exception, tool: str) -> str:
+    if isinstance(exc, _CustomerIntelligenceValidationError):
+        return "Invalid request parameters."
+    if isinstance(exc, _KeyNotAccepted):
+        return _unauthenticated(tool)
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         try:
@@ -155,19 +526,14 @@ def _format_error(exc: Exception) -> str:
         # must not be pasted into an assistant's context.
         detail = " ".join(str(detail).split())[:300]
         if status == 401:
-            return (
-                "Authentication failed (401): bad or missing API key. "
-                "This tool requires a valid BLACKDOME_API_KEY. "
-                "Get one at https://blackdome.ai/pricing. "
-                f"Server said: {detail}"
-            )
+            return _unauthenticated(tool)
         if status == 403:
-            return f"Access denied (403): {_denied_reason(detail)} Server said: {detail}"
+            return f"Access denied (403): {_denied_reason(detail, tool)} Server said: {detail}"
         if status == 429:
             # The server's message names this account's own limit.
             return f"Rate limited (429): {detail}" + _retry_hint(exc.response)
         return f"API error {status}: {detail}"
-    return f"Request failed: {exc}"
+    return _transport_failure(exc) or f"Request failed: {exc.__class__.__name__}."
 
 
 class _CustomerIntelligenceValidationError(ValueError):
@@ -190,7 +556,7 @@ _THREATDROP_MCP_TEXT_LIMIT = 256
 
 
 def _validation_error() -> str:
-    return "Invalid request parameters."
+    return _fail("Invalid request parameters.")
 
 
 def _has_unsafe_text(value: str) -> bool:
@@ -269,19 +635,34 @@ def _validate_submission_id(value: object) -> int:
     return _validate_positive_int(value)
 
 
-def _format_customer_intelligence_error(exc: Exception) -> str:
-    """Return an explicit but selector-safe customer intelligence error."""
+def _format_customer_intelligence_error(exc: Exception, tool: str) -> str:
+    return _fail(_format_customer_intelligence_error_text(exc, tool))
+
+
+def _fixed_403_detail(response: httpx.Response) -> str:
+    """The service's 403 reason when it is one of its fixed strings (never a selector), else ""."""
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return ""
+    return detail if isinstance(detail, str) and detail in _FIXED_403_DETAILS else ""
+
+
+def _format_customer_intelligence_error_text(exc: Exception, tool: str) -> str:
+    """Return an explicit but selector-safe customer intelligence error (the server's text is never relayed)."""
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         if status == 401:
-            return "Authentication failed (401): bad or missing API key."
+            return _unauthenticated(tool)
         if status == 403:
-            return "Access denied (403): your plan does not include this feature."
+            return "Access denied (403): " + _denied_reason(_fixed_403_detail(exc.response), tool)
         if status == 429:
             # No server text on this path; a retry time only when the service sent one.
             return "Rate limited (429): the request limit of your plan is reached." + _retry_hint(exc.response)
         return f"Customer intelligence request unavailable ({status})."
-    return "Customer intelligence request unavailable."
+    if isinstance(exc, _CustomerIntelligenceValidationError):
+        return "Invalid request parameters."
+    return _transport_failure(exc) or "Customer intelligence request unavailable."
 
 
 # Password-like keys redacted from keyless tool output (defense-in-depth: catches
@@ -313,6 +694,126 @@ def _mask_credentials(payload: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Answers an assistant can use (2026-11-21, full test 04 findings 6-8, item D4)
+# ---------------------------------------------------------------------------
+#
+# - Every list tool takes a limit with a default and a maximum, and the answer says in "more" when there is more.
+# - Every timestamp leaves in UTC with a Z: ISO strings with an offset are converted, and a "<name>_str" field
+#   that sits beside a "<name>" epoch number is rewritten from that number (get_actor's *_str fields were the
+#   API host's local time with no zone, an hour off UTC).
+
+_ISO_WITH_ZONE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$"
+)
+_LIST_KEYS = ("items", "detonations", "sessions", "credentials", "countries", "events", "steps", "iocs",
+              "objects", "families", "specimens")
+
+
+def _utc_text(value: Any) -> Optional[str]:
+    """An ISO timestamp with a zone, or an epoch number, as UTC 'YYYY-MM-DDTHH:MM:SSZ'; None when it is neither."""
+    from datetime import datetime, timezone
+
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if not 1_000_000_000 <= value <= 10_000_000_000:
+                return None
+            moment = datetime.fromtimestamp(value, tz=timezone.utc)
+        elif isinstance(value, str) and _ISO_WITH_ZONE_RE.fullmatch(value):
+            moment = datetime.fromisoformat(value.replace("Z", "+00:00").replace(" ", "T", 1))
+        elif hasattr(value, "tzinfo") and getattr(value, "tzinfo", None) is not None:
+            moment = value
+        else:
+            return None
+        return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _in_utc(payload: Any) -> Any:
+    """The payload with every zoned timestamp in UTC with a Z (see above)."""
+    if isinstance(payload, dict):
+        out = {}
+        for key, value in payload.items():
+            if isinstance(key, str) and key.endswith("_str") and key[:-4] in payload:
+                epoch = _utc_text(payload[key[:-4]]) if isinstance(payload[key[:-4]], (int, float)) else None
+                if epoch is not None:
+                    out[key] = epoch
+                    continue
+            out[key] = _in_utc(value)
+        return out
+    if isinstance(payload, list):
+        return [_in_utc(item) for item in payload]
+    if isinstance(payload, str) or hasattr(payload, "tzinfo"):
+        converted = _utc_text(payload)
+        return converted if converted is not None else payload
+    return payload
+
+
+def _dump(payload: Any) -> str:
+    """The JSON text of a tool answer, timestamps in UTC."""
+    return json.dumps(_in_utc(payload), indent=2, default=str)
+
+
+def _main_list(payload: Any) -> tuple[Optional[str], Optional[list]]:
+    if isinstance(payload, dict):
+        for key in _LIST_KEYS:
+            if isinstance(payload.get(key), list):
+                return key, payload[key]
+    return None, None
+
+
+def _add_more(payload: Any, sentence: str) -> None:
+    if isinstance(payload, dict):
+        existing = payload.get("more")
+        payload["more"] = f"{existing} {sentence}" if isinstance(existing, str) and existing else sentence
+
+
+def _say_if_more(payload: Any, limit: int, maximum: int, *, param: str = "limit", offset_param: Optional[str] = None,
+                 offset: int = 0) -> Any:
+    """Add a "more" sentence when the answer's list may not be all there is."""
+    key, items = _main_list(payload)
+    if key is None:
+        return payload
+    shown = len(items)
+    total = payload.get("total") if isinstance(payload.get("total"), int) else None
+    has_more = payload.get("has_more") is True or isinstance(payload.get("next_offset"), int) or (
+        total is not None and total > offset + shown)
+    if not has_more and (total is not None or shown < limit):
+        return payload
+    how = f"raise {param} (at most {maximum})" if limit < maximum else ""
+    if offset_param:
+        page = f"pass {offset_param}={offset + shown} for the next page"
+        how = f"{how} or {page}" if how else page
+    counted = f"{shown} of {total} {key}" if total is not None else f"{shown} {key}"
+    sure = "There are more" if has_more else "There may be more"
+    _add_more(payload, f"Showing {counted}. {sure}" + (f": {how}." if how else "."))
+    return payload
+
+
+def _cap_list(container: Any, key: str, limit: int, *, label: str, param: str, maximum: int,
+              holder: Any = None) -> None:
+    """Shorten container[key] to ``limit`` items, saying so in holder["more"] (holder defaults to container)."""
+    if not isinstance(container, dict) or not isinstance(container.get(key), list):
+        return
+    items = container[key]
+    if len(items) <= limit:
+        return
+    container[key] = items[:limit]
+    how = f": raise {param} (at most {maximum})" if limit < maximum else ""
+    _add_more(holder if holder is not None else container,
+              f"Showing {limit} of {len(items)} {label}. There are more{how}.")
+
+
+def _clamp(value: int, lowest: int, highest: int) -> int:
+    try:
+        return max(lowest, min(int(value), highest))
+    except (TypeError, ValueError):
+        return lowest
+
+
+# ---------------------------------------------------------------------------
 # Public tools (no API key required)
 # ---------------------------------------------------------------------------
 
@@ -336,20 +837,20 @@ async def lookup_attacker_ip(ip: str) -> str:
         ip: The attacker IP address to look up (e.g. "176.65.139.56")
     """
     try:
-        payload = await _get(f"/api/blackdome/lookup/{quote(ip, safe='')}")
+        payload = await _get(f"/api/blackdome/lookup/{quote(_validate_ip(ip), safe='')}")
         # SECURITY: mask plaintext passwords before returning — the keyless
         # lookup endpoint leaks raw credentials, the MCP tool must not.
         payload = _mask_credentials(payload)
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             return json.dumps(
                 {"found": False, "ip": ip, "detail": "No recorded events for this IP"},
                 indent=2,
             )
-        return _format_error(exc)
+        return _format_error(exc, "lookup_attacker_ip")
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "lookup_attacker_ip")
 
 
 @mcp.tool()
@@ -362,16 +863,17 @@ async def top_attackers(days: int = 30, limit: int = 5) -> str:
 
     Args:
         days: Lookback period in days (default 30)
-        limit: Max attackers to return (default 5)
+        limit: Max attackers to return (default 5, at most 100)
     """
     try:
+        limit = _clamp(limit, 1, 100)  # API caps at 100
         payload = await _get("/api/blackdome/top-attackers", {
             "days": min(days, 30),   # API caps at 30
-            "limit": min(limit, 100),  # API caps at 100
+            "limit": limit,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, 100))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "top_attackers")
 
 
 @mcp.tool()
@@ -384,15 +886,16 @@ async def attack_map(limit: int = 10) -> str:
     422), so the default is 10.
 
     Args:
-        limit: Max events to return (minimum 10, default 10)
+        limit: Max events to return (minimum 10, default 10, at most 100)
     """
     try:
+        limit = _clamp(limit, 10, 100)
         payload = await _get("/api/blackdome/map/events", {
-            "limit": max(limit, 10),
+            "limit": limit,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, 100))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "attack_map")
 
 
 @mcp.tool()
@@ -403,15 +906,16 @@ async def attack_heatmap(limit: int = 5) -> str:
     plus a 7-day summary. NOTE: limit minimum is 5 (lower values return 422).
 
     Args:
-        limit: Max countries to return (minimum 5, default 5)
+        limit: Max countries to return (minimum 5, default 5, at most 50)
     """
     try:
+        limit = _clamp(limit, 5, 50)
         payload = await _get("/api/blackdome/map/heatmap", {
-            "limit": max(limit, 5),
+            "limit": limit,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, 50))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "attack_heatmap")
 
 
 @mcp.tool()
@@ -424,19 +928,20 @@ async def credential_preview(limit: int = 5, hours: int = 24) -> str:
     plaintext corpus.
 
     Args:
-        limit: Max sample credentials to return (default 5)
+        limit: Max sample credentials to return (default 5, at most 25)
         hours: Lookback window in hours (default 24)
     """
     try:
         # NOTE: passwords are ALREADY masked server-side on this endpoint ('****'),
         # so we do NOT re-mask here.
+        limit = _clamp(limit, 1, 25)  # API caps at 25
         payload = await _get("/api/blackdome/credentials/preview", {
-            "limit": min(limit, 25),  # API caps at 25
+            "limit": limit,
             "hours": min(hours, 24),  # API caps at 24
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "credential_preview")
 
 
 @mcp.tool()
@@ -451,17 +956,17 @@ async def verify_sigil(sigil_id: str) -> str:
         sigil_id: The sigil id to verify (e.g. "SIGIL-EEEB0646")
     """
     try:
-        payload = await _get(f"/api/blackdome/audit/{quote(sigil_id, safe='')}")
-        return json.dumps(payload, indent=2, default=str)
+        payload = await _get(f"/api/blackdome/audit/{_path_segment(sigil_id)}")
+        return _dump(payload)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             return json.dumps(
                 {"found": False, "sigil_id": sigil_id, "detail": "Sigil not found / invalid"},
                 indent=2,
             )
-        return _format_error(exc)
+        return _format_error(exc, "verify_sigil")
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "verify_sigil")
 
 
 @mcp.tool()
@@ -482,19 +987,20 @@ async def recent_iocs(
     Args:
         ioc_type: Filter by IOC type (e.g. "sha256", "ipv4", "domain", "url")
         severity: Filter by severity (e.g. "high", "medium", "low")
-        limit: Max IOCs to return (default 20, capped at 25)
+        limit: Max IOCs to return (default 20, at most 25)
     """
     try:
         # Public redacted preview. /api/blackdome/iocs is the KEYED customer
         # feed; /api/blackdome/threat-intel/iocs is its external twin.
+        limit = _clamp(limit, 1, 25)
         payload = await _get("/api/blackdome/iocs/public", {
             "ioc_type": ioc_type,
             "severity": severity,
             "limit": limit,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, 25))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "recent_iocs")
 
 
 @mcp.tool()
@@ -515,14 +1021,44 @@ async def ioc_trends(days: int = 7) -> str:
         payload = await _get("/api/blackdome/iocs/public/trends", {
             "days": days,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "ioc_trends")
 
 
 # ---------------------------------------------------------------------------
 # Community-free / tiered export
 # ---------------------------------------------------------------------------
+
+
+_EXPORT_MAX = 1000
+
+
+def _cap_csv(text: str, limit: int) -> str:
+    lines = text.splitlines(keepends=True)
+    if len(lines) - 1 <= limit:
+        return text
+    kept = "".join(lines[: limit + 1])
+    if not kept.endswith("\n"):
+        kept += "\n"
+    return kept + (f"# Showing {limit} of {len(lines) - 1} rows. There are more: raise limit "
+                   f"(at most {_EXPORT_MAX}).\n" if limit < _EXPORT_MAX else
+                   f"# Showing {limit} of {len(lines) - 1} rows. There are more: narrow days or ioc_type.\n")
+
+
+def _cap_stix(bundle: Any, limit: int) -> None:
+    """Keep the first ``limit`` indicator objects of a STIX bundle (and every non-indicator object)."""
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("objects"), list):
+        return
+    objects = bundle["objects"]
+    indicators = [o for o in objects if isinstance(o, dict) and o.get("type") == "indicator"]
+    if len(indicators) <= limit:
+        return
+    keep = {id(o) for o in indicators[:limit]}
+    bundle["objects"] = [o for o in objects if not (isinstance(o, dict) and o.get("type") == "indicator") or id(o) in keep]
+    how = f": raise limit (at most {_EXPORT_MAX})" if limit < _EXPORT_MAX else ": narrow days or ioc_type"
+    # A custom bundle property (STIX 2.1 names custom properties x_...), so a STIX reader still accepts it.
+    bundle["x_blackdome_more"] = f"Showing {limit} of {len(indicators)} indicators. There are more{how}."
 
 
 @mcp.tool()
@@ -532,6 +1068,7 @@ async def export_iocs(
     min_confidence: int = 50,
     min_severity: str = "medium",
     days: int = 30,
+    limit: int = 100,
 ) -> str:
     """Export the IOC threat-intel feed as json, csv (free) or stix (Threat Intel Pro).
 
@@ -546,11 +1083,13 @@ async def export_iocs(
         min_confidence: Minimum confidence 0-100 (default 50; pass 0 for full set)
         min_severity: Minimum severity (default "medium")
         days: Lookback period in days, 1-365 (default 30)
+        limit: Max indicators returned (default 100, at most 1000); the answer says when there are more
     """
     fmt = (fmt or "json").lower()
+    limit = _clamp(limit, 1, _EXPORT_MAX)
     if fmt not in ("json", "csv", "stix"):
-        return "Invalid fmt: choose one of 'json', 'csv', 'stix'."
-    url = f"{BASE_URL}/api/v1/blackdome/threat-intel/feed/{fmt}"
+        return _fail("Invalid fmt: choose one of 'json', 'csv', 'stix'.")
+    url = f"{BASE_URL}{_api_path(f'/api/v1/blackdome/threat-intel/feed/{fmt}')}"
     params = {
         "ioc_type": ioc_type,
         "min_confidence": min_confidence,
@@ -565,15 +1104,21 @@ async def export_iocs(
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.get(url, headers=headers, params=params)
+            _record_limit(resp)
             resp.raise_for_status()
             if fmt == "csv":
-                # csv branch -> raw text body, returned verbatim.
-                return resp.text
+                # csv branch -> the raw text body, cut to the header and `limit` rows.
+                return _cap_csv(resp.text, limit)
             # json and stix branches -> structured JSON (flat feed object or
-            # a STIX 2.1 bundle).
-            return json.dumps(resp.json(), indent=2, default=str)
+            # a STIX 2.1 bundle), cut to `limit` indicators.
+            payload = resp.json()
+            if fmt == "json":
+                _cap_list(payload, "iocs", limit, label="indicators", param="limit", maximum=_EXPORT_MAX)
+            else:
+                _cap_stix(payload, limit)
+            return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "export_iocs:stix" if fmt == "stix" else "export_iocs")
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +1153,7 @@ async def search_credentials(
         protocol: Filter by protocol (e.g. "ssh", "http", "smtp")
         since: ISO timestamp lower bound
         cross_protocol: Only credentials seen across multiple protocols
-        limit: Max records (default 20)
+        limit: Max records (default 20, at most 100)
         offset: Pagination offset (default 0)
     """
     try:
@@ -621,12 +1166,12 @@ async def search_credentials(
             "protocol": protocol,
             "since": since,
             "cross_protocol": cross_protocol,
-            "limit": limit,
+            "limit": _clamp(limit, 1, 100),
             "offset": offset,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, _clamp(limit, 1, 100), 100, offset_param="offset", offset=offset))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "search_credentials")
 
 
 @mcp.tool()
@@ -649,9 +1194,9 @@ async def credential_stats(
             "since": since,
             "protocol": protocol,
         })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "credential_stats")
 
 
 @mcp.tool()
@@ -669,17 +1214,18 @@ async def list_payloads(sha256: Optional[str] = None, limit: int = 20) -> str:
 
     Args:
         sha256: Optional payload sha256 — when given, returns that payload's detail
-        limit: Max payloads in list mode (default 20)
+        limit: Max payloads in list mode (default 20, at most 100)
     """
     try:
+        limit = _clamp(limit, 1, 100)
         if sha256:
             # detail mode -> /payloads/{sha256} (different envelope from list).
-            payload = await _get(f"/api/v1/blackdome/payloads/{quote(sha256, safe='')}")
+            payload = await _get(f"/api/v1/blackdome/payloads/{_path_segment(sha256)}")
         else:
-            payload = await _get("/api/v1/blackdome/payloads", {"limit": limit})
-        return json.dumps(payload, indent=2, default=str)
+            payload = _say_if_more(await _get("/api/v1/blackdome/payloads", {"limit": limit}), limit, 100)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "list_payloads")
 
 
 @mcp.tool()
@@ -699,15 +1245,16 @@ async def get_actor(
 
     Args:
         actor_id: Optional actor id — when given, returns that actor's sessions
-        limit: Max actors/sessions to return (default 20)
+        limit: Max actors/sessions to return (default 20, at most 100)
         risk: Filter by risk level (e.g. "medium")
         sort: Sort field (e.g. "risk")
         descending: Sort descending
     """
     try:
+        limit = _clamp(limit, 1, 100)
         if actor_id:
             # sessions sub-resource -> /actors/{actor_id}/sessions
-            payload = await _get(f"/api/v1/blackdome/actors/{quote(actor_id, safe='')}/sessions", {
+            payload = await _get(f"/api/v1/blackdome/actors/{_path_segment(actor_id)}/sessions", {
                 "limit": limit,
             })
         else:
@@ -717,38 +1264,9 @@ async def get_actor(
                 "sort": sort,
                 "descending": descending,
             })
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, 100))
     except Exception as exc:
-        return _format_error(exc)
-
-
-@mcp.tool()
-async def warboard(
-    limit: int = 5,
-    threat: Optional[str] = None,
-    public: Optional[bool] = None,
-) -> str:
-    """Get the warboard leaderboard of earned Sigils with intrusion narratives (Threat Intel Analyst or Pro).
-
-    Returns sigils with threat level, sophistication, persona stage, geo, MITRE
-    chain glyphs, proof packs and a tail of the attacker's real shell commands.
-    The 'public' flag is a content filter, not an auth bypass — the endpoint
-    still requires a valid key.
-
-    Args:
-        limit: Max sigils to return (default 5)
-        threat: Filter by threat level (e.g. "low", "high")
-        public: Restrict to publicly shareable sigils
-    """
-    try:
-        payload = await _get("/api/v1/blackdome/warboard", {
-            "limit": limit,
-            "threat": threat,
-            "public": public,
-        })
-        return json.dumps(payload, indent=2, default=str)
-    except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "get_actor")
 
 
 @mcp.tool()
@@ -759,26 +1277,24 @@ async def list_notable_sessions(
     technique: Optional[str] = None,
     human_likely: Optional[bool] = None,
     actor_id: Optional[str] = None,
-    limit: int = 100,
+    limit: int = 20,
 ) -> str:
-    """List rare hand-keyed attacker sessions ranked by score (session_intel; no plan on sale includes it).
+    """List notable honeypot sessions. Requires Threat Intel Analyst or Pro.
 
     Returns a flat object with count and sessions[]. Each session includes
     session_id, actor_id, ip, geo, command_count, distinct_techniques,
     primary_tactic, persona_stage, persona_score, score, first_ts, last_ts,
-    novelty, dropped_artifact_count and human_likely (no sensor name; ip is
-    the attacker's public address or null). Use this to
-    surface the most interesting hands-on-keyboard intrusions out of botnet
-    probe noise. Requires the session_intel feature, which no plan on sale includes.
+    novelty, dropped_artifact_count and human_likely. The list shows public
+    attacker addresses.
 
     Args:
         min_commands: Minimum command count (default 3)
-        since: ISO timestamp lower bound
+        since: ISO timestamp lower bound within the last two days
         service: Filter by service (e.g. "ssh")
         technique: Filter by MITRE technique id (e.g. "T1059")
         human_likely: Only return sessions matching the human-likely heuristic
         actor_id: Filter by actor id
-        limit: Max sessions to return (default 100, capped at 100)
+        limit: Max sessions to return (default 20, at most 100)
     """
     try:
         payload = await _get(
@@ -790,18 +1306,18 @@ async def list_notable_sessions(
                 "technique": technique,
                 "human_likely": human_likely,
                 "actor_id": actor_id,
-                "limit": min(limit, 100),
+                "limit": _clamp(limit, 1, 100),
             },
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, _clamp(limit, 1, 100), 100))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "list_notable_sessions")
 
 
 @mcp.tool()
 async def get_session_transcript(
     session_id: str,
-    limit: int = 500,
+    limit: int = 100,
     offset: int = 0,
 ) -> str:
     """Get a structured attacker session transcript (session_intel; no plan on sale includes it).
@@ -816,20 +1332,22 @@ async def get_session_transcript(
 
     Args:
         session_id: Session id returned by list_notable_sessions
-        limit: Max transcript steps to return (default 500, capped at 1000)
+        limit: Max transcript steps to return (default 100, at most 1000)
         offset: Pagination offset
     """
     try:
         payload = await _get(
-            f"/api/v1/blackdome/intel/sessions/{quote(session_id, safe='')}/transcript",
+            f"/api/v1/blackdome/intel/sessions/{_path_segment(session_id)}/transcript",
             {
-                "limit": min(limit, 1000),
+                "limit": _clamp(limit, 1, 1000),
                 "offset": offset,
             },
         )
-        return json.dumps(payload, indent=2, default=str)
+        if isinstance(payload, dict) and isinstance(payload.get("total_steps"), int):
+            payload.setdefault("total", payload["total_steps"])
+        return _dump(_say_if_more(payload, _clamp(limit, 1, 1000), 1000, offset_param="offset", offset=offset))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "get_session_transcript")
 
 
 @mcp.tool()
@@ -838,7 +1356,7 @@ async def list_detonations(
     vm_type: Optional[str] = None,
     sha256: Optional[str] = None,
     since: Optional[str] = None,
-    limit: int = 100,
+    limit: int = 20,
 ) -> str:
     """List malware detonation reports with IOC counts and file classification (paid: Pro detonation_intel).
 
@@ -854,7 +1372,7 @@ async def list_detonations(
             sent, so existing calls keep working). Read sandbox_kind instead.
         sha256: Filter by artifact sha256
         since: ISO timestamp lower bound
-        limit: Max detonations to return (default 100, capped at 100)
+        limit: Max detonations to return (default 20, at most 100)
     """
     try:
         payload = await _get(
@@ -864,16 +1382,16 @@ async def list_detonations(
                 "vm_type": vm_type,
                 "sha256": sha256,
                 "since": since,
-                "limit": min(limit, 100),
+                "limit": _clamp(limit, 1, 100),
             },
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, _clamp(limit, 1, 100), 100))
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "list_detonations")
 
 
 @mcp.tool()
-async def get_detonation_report(detonation_id: str) -> str:
+async def get_detonation_report(detonation_id: str, ioc_limit: int = 25) -> str:
     """Get a full malware detonation report (paid: Pro detonation_intel).
 
     Returns detonation_id, sha256, verdict, started_at, finished_at,
@@ -892,18 +1410,20 @@ async def get_detonation_report(detonation_id: str) -> str:
 
     Args:
         detonation_id: Detonation id returned by list_detonations
+        ioc_limit: Max rows of iocs[] to return (default 25, at most 500)
     """
     try:
         payload = await _get(
-            f"/api/v1/blackdome/intel/detonations/{quote(detonation_id, safe='')}"
+            f"/api/v1/blackdome/intel/detonations/{_path_segment(detonation_id)}"
         )
-        return json.dumps(payload, indent=2, default=str)
+        _cap_list(payload, "iocs", _clamp(ioc_limit, 1, 500), label="iocs", param="ioc_limit", maximum=500)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "get_detonation_report")
 
 
 @mcp.tool()
-async def get_artifact(sha256: str) -> str:
+async def get_artifact(sha256: str, ioc_limit: int = 25) -> str:
     """Get an artifact dossier with linked detonation, IOCs and session reference (paid: Pro detonation_intel).
 
     Returns artifact classification fields, linked detonation summary, iocs[],
@@ -914,14 +1434,16 @@ async def get_artifact(sha256: str) -> str:
 
     Args:
         sha256: Artifact sha256 to inspect
+        ioc_limit: Max rows of iocs[] to return (default 25, at most 500)
     """
     try:
         payload = await _get(
-            f"/api/v1/blackdome/intel/artifacts/{quote(sha256, safe='')}"
+            f"/api/v1/blackdome/intel/artifacts/{_path_segment(sha256)}"
         )
-        return json.dumps(payload, indent=2, default=str)
+        _cap_list(payload, "iocs", _clamp(ioc_limit, 1, 500), label="iocs", param="ioc_limit", maximum=500)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "get_artifact")
 
 
 @mcp.tool()
@@ -936,9 +1458,9 @@ async def whoami() -> str:
     """
     try:
         payload = await _get("/api/v1/blackdome/me")
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except Exception as exc:
-        return _format_error(exc)
+        return _format_error(exc, "whoami")
 
 
 # ---------------------------------------------------------------------------
@@ -946,9 +1468,84 @@ async def whoami() -> str:
 # ---------------------------------------------------------------------------
 
 
+NO_EVIDENCE_RECORD = "No evidence record for this indicator."
+_EVIDENCE_SHOWN = 10
+_LINKS_SHOWN = 25
+
+
+def _label_of(item: Any, *keys: str) -> Optional[str]:
+    for key in keys:
+        value = item.get(key) if isinstance(item, dict) else None
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _evidence_record(indicator_type: str, value: str, payload: Any) -> dict[str, Any]:
+    """The API's evidence record, said plainly: the indicator, where and when it was seen, what it links to.
+
+    Full test 2026-11-21 (finding 6): a hit was 14 KB of hashes with the indicator itself not echoed, so it did
+    not show where we saw it or what it links to. Hashes that only key the graph are left out."""
+    payload = payload if isinstance(payload, dict) else {}
+    entity = payload.get("entity") if isinstance(payload.get("entity"), dict) else {}
+    references = [r for r in payload.get("evidence_references") or [] if isinstance(r, dict)]
+    seen_times = sorted(t for t in (_utc_text(r.get("observed_at")) for r in references) if t)
+    where = sorted({w for w in (_label_of(r, "provenance_label", "provenance") for r in references) if w})
+    evidence = [
+        {
+            "seen_at": r.get("observed_at"),
+            "where": _label_of(r, "provenance_label", "provenance"),
+            "verified": _label_of(r, "quality_label"),
+            "why_not_verified": _label_of(r, "reason_label"),
+            "file_analysis": _label_of(r, "analysis_label"),
+        }
+        for r in sorted(references, key=lambda r: str(r.get("observed_at") or ""), reverse=True)[:_EVIDENCE_SHOWN]
+    ]
+    own_key = entity.get("entity_key") or payload.get("entity_key")
+    linked = [
+        {k: e[k] for k in ("entity_type", "canonical_facts") if e.get(k) not in (None, {}, [])}
+        for e in payload.get("linked_entities") or []
+        if isinstance(e, dict) and e.get("entity_key") != own_key
+    ]
+    edges = [e for e in payload.get("edges") or [] if isinstance(e, dict)]
+    record: dict[str, Any] = {
+        "indicator": {"type": indicator_type, "value": value},
+        "found": True,
+        "first_recorded_at": entity.get("created_at"),
+        "first_seen": seen_times[0] if seen_times else None,
+        "last_seen": seen_times[-1] if seen_times else None,
+        "where_seen": where or [_label_of(payload, "provenance_label", "provenance")],
+        "evidence_count": len(references),
+        "verified": _label_of(payload, "uncertainty_label"),
+        "why_not_verified": _label_of(payload, "uncertainty_reason_label"),
+        "completeness": _label_of(payload, "completeness_label"),
+        "facts": entity.get("canonical_facts") or {},
+        "links_to": linked[:_LINKS_SHOWN],
+        "links": edges[:_LINKS_SHOWN],
+        "evidence": evidence,
+    }
+    if not linked and not edges:
+        record["links_note"] = "The malware graph links this indicator to nothing else yet."
+    if len(references) > _EVIDENCE_SHOWN:
+        _add_more(record, f"Showing the newest {_EVIDENCE_SHOWN} of {len(references)} evidence records.")
+    if len(linked) > _LINKS_SHOWN or len(edges) > _LINKS_SHOWN:
+        _add_more(record, f"Showing {_LINKS_SHOWN} links of {max(len(linked), len(edges))}.")
+    return record
+
+
 @mcp.tool()
 async def explain_ioc(indicator_type: str, indicator_value: str) -> str:
-    """Explain observed evidence for an IP, domain, or URL (Threat Intel Analyst or Pro: ioc_explanation)."""
+    """An evidence record for an indicator in our malware graph (an IP, domain or URL): where and when we saw it,
+    and what it links to (Threat Intel Analyst or Pro; plan feature `ioc_explanation`).
+
+    Returns the indicator, first and last time seen, where it was seen, whether the evidence is verified, the
+    entities it links to and the newest evidence records. Most indicators in the feed are not in the malware
+    graph, and then the answer is "No evidence record for this indicator."
+
+    Args:
+        indicator_type: "ip", "domain" or "url"
+        indicator_value: The indicator, e.g. "203.0.113.7", "example.com" or "https://example.com/x"
+    """
     try:
         if indicator_type not in {"ip", "domain", "url"}:
             raise _CustomerIntelligenceValidationError
@@ -958,11 +1555,15 @@ async def explain_ioc(indicator_type: str, indicator_value: str) -> str:
             "/api/v1/blackdome/intelligence/ioc/explain",
             {"indicator_type": indicator_type, "value": value},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_evidence_record(indicator_type, value, payload))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return NO_EVIDENCE_RECORD
+        return _format_customer_intelligence_error(exc, "explain_ioc")
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "explain_ioc")
 
 
 @mcp.tool()
@@ -974,11 +1575,11 @@ async def compare_samples(left_sha256: str, right_sha256: str) -> str:
             "/api/v1/blackdome/intelligence/samples/compare",
             {"left_sha256": left, "right_sha256": right},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "compare_samples")
 
 
 @mcp.tool()
@@ -1010,11 +1611,11 @@ async def get_evidence_cluster(
                 "max_evidence": max_evidence,
             },
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "get_evidence_cluster")
 
 
 @mcp.tool()
@@ -1026,11 +1627,14 @@ async def get_reproducible_novelty(entity_kind: str, value: str) -> str:
             "/api/v1/blackdome/intelligence/genome/novelty",
             {"entity_kind": entity_kind, "value": value},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "get_reproducible_novelty")
+
+
+NO_THREATDROP_SUBMISSION = "No ThreatDrop submission with this id on this account."
 
 
 @mcp.tool()
@@ -1041,11 +1645,15 @@ async def get_threatdrop_case(submission_id: int) -> str:
         payload = await _get(
             f"/api/v1/blackdome/threatdrop/submissions/{submission_id}/mcp-summary"
         )
-        return json.dumps(_threatdrop_mcp_summary_subset(payload), indent=2, default=str)
+        return _dump(_threatdrop_mcp_summary_subset(payload))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return NO_THREATDROP_SUBMISSION
+        return _format_customer_intelligence_error(exc, "get_threatdrop_case")
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "get_threatdrop_case")
 
 
 _TAKEDOWN_SUBMISSION_SCALAR_TYPES = {
@@ -1340,11 +1948,15 @@ async def get_takedown_status(submission_id: int) -> str:
         payload = await _get(
             f"/api/v1/blackdome/threatdrop/submissions/{submission_id}/mcp-summary"
         )
-        return json.dumps(_takedown_status_subset(payload), indent=2, default=str)
+        return _dump(_takedown_status_subset(payload))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return NO_THREATDROP_SUBMISSION
+        return _format_customer_intelligence_error(exc, "get_takedown_status")
     except Exception as exc:
-        return _format_customer_intelligence_error(exc)
+        return _format_customer_intelligence_error(exc, "get_takedown_status")
 
 
 # ---------------------------------------------------------------------------
@@ -1382,47 +1994,35 @@ def _validate_catalogue_query(value: object) -> str:
     return value
 
 
-# The service's 403 reasons on this path are fixed strings, raised before the request body is read, so they can
-# never contain a selector. Each known reason gets its own hint (a paying customer whose key expired must not be
-# told to upgrade); any other detail gets the generic hint. The server's text itself is never relayed.
-_CATALOGUE_DENIED = {
-    "Feature requires a higher plan": (
-        "this account's plan does not include the specimen catalogue; it needs Threat Intel Pro "
-        "(feature genome_clusters). See https://blackdome.ai/products/threat-intel."),
-    "Subscription inactive": (
-        "the subscription on this key's account is not active. Check billing in your BlackDome dashboard."),
-    "Insufficient scope: requires 'read'": "this API key does not have the read scope.",
-    "API key has expired": "this API key has expired. Create a new key in your BlackDome dashboard.",
-    "Tenant account is inactive": "this BlackDome account is inactive.",
-}
-_CATALOGUE_DENIED_DEFAULT = (
-    "the specimen catalogue needs Threat Intel Pro (feature genome_clusters). "
-    "See https://blackdome.ai/products/threat-intel.")
+# The service's 403 reasons on the customer-intelligence and catalogue paths are fixed strings, raised before the
+# request body is read, so they can never contain a selector. Only these are read (to tell an expired key or an
+# inactive account from a plan problem); the server's text itself is never relayed.
+_FIXED_403_DETAILS = frozenset({
+    "Feature requires a higher plan",
+    "Subscription inactive",
+    "Insufficient scope: requires 'read'",
+    "API key has expired",
+    "Tenant account is inactive",
+})
 
 
-def _catalogue_denied_reason(response: httpx.Response) -> str:
-    try:
-        detail = response.json().get("detail")
-    except Exception:
-        return _CATALOGUE_DENIED_DEFAULT
-    if not isinstance(detail, str):
-        return _CATALOGUE_DENIED_DEFAULT
-    return _CATALOGUE_DENIED.get(detail, _CATALOGUE_DENIED_DEFAULT)
+def _format_catalogue_error(exc: Exception, tool: str) -> str:
+    return _fail(_format_catalogue_error_text(exc, tool))
 
 
-def _format_catalogue_error(exc: Exception) -> str:
+def _format_catalogue_error_text(exc: Exception, tool: str) -> str:
     """Explicit status, never the server's own message (which could echo a selector)."""
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         if status == 400:
             return "Invalid request (400): the service rejected these parameters."
         if status == 403:
-            return "Access denied (403): " + _catalogue_denied_reason(exc.response)
+            return "Access denied (403): " + _denied_reason(_fixed_403_detail(exc.response), tool)
         if status == 404:
             return "Not found (404): nothing in the specimen catalogue matches."
         if status == 503:
             return "Specimen catalogue unavailable (503). Try again shortly."
-    return _format_customer_intelligence_error(exc)
+    return _format_customer_intelligence_error_text(exc, tool)
 
 
 @mcp.tool()
@@ -1444,15 +2044,17 @@ async def list_catalogue_families(limit: int = 25, offset: int = 0) -> str:
             "/api/v1/blackdome/intelligence/catalogue/families",
             {"limit": limit, "offset": offset},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, _CATALOGUE_FAMILY_PAGE_MAX, offset_param="offset", offset=offset))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_catalogue_error(exc)
+        return _format_catalogue_error(exc, "list_catalogue_families")
 
 
 @mcp.tool()
-async def get_catalogue_family(family: str, member_limit: int = 50, member_offset: int = 0) -> str:
+async def get_catalogue_family(
+    family: str, member_limit: int = 20, member_offset: int = 0, timeline_limit: int = 20
+) -> str:
     """Get one specimen family: members, build history, tools, indicators and related families (Pro: genome_clusters).
 
     Related families share a wallet or control server (same operator) or a
@@ -1462,8 +2064,9 @@ async def get_catalogue_family(family: str, member_limit: int = 50, member_offse
     Args:
         family: Family key (12 hex), name (e.g. "mozi-007ba229e43c") or a key
             prefix that matches exactly one family
-        member_limit: Members per page (1-200, default 50)
+        member_limit: Members per page (1-200, default 20)
         member_offset: Members to skip (0-10000)
+        timeline_limit: Newest timeline events to return (1-500, default 20)
     """
     try:
         family = _validate_family(family)
@@ -1473,11 +2076,21 @@ async def get_catalogue_family(family: str, member_limit: int = 50, member_offse
             "/api/v1/blackdome/intelligence/catalogue/family",
             {"family": family, "member_limit": member_limit, "member_offset": member_offset},
         )
-        return json.dumps(payload, indent=2, default=str)
+        if isinstance(payload, dict):
+            _cap_list(payload.get("timeline"), "events", _clamp(timeline_limit, 1, 500), label="timeline events",
+                      param="timeline_limit", maximum=500, holder=payload)
+            members = payload.get("members")
+            if isinstance(members, dict) and isinstance(members.get("items"), list):
+                total = members.get("total") if isinstance(members.get("total"), int) else None
+                shown = len(members["items"])
+                if (total is not None and total > member_offset + shown) or (total is None and shown >= member_limit):
+                    _add_more(payload, f"Showing {shown} members{f' of {total}' if total is not None else ''}. "
+                                       f"Pass member_offset={member_offset + shown} for the next page.")
+        return _dump(payload)
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_catalogue_error(exc)
+        return _format_catalogue_error(exc, "get_catalogue_family")
 
 
 @mcp.tool()
@@ -1494,11 +2107,11 @@ async def get_catalogue_specimen(sha256: str) -> str:
     try:
         sha256 = _validate_sha256(sha256)
         payload = await _post("/api/v1/blackdome/intelligence/catalogue/specimen", {"sha256": sha256})
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(payload)
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_catalogue_error(exc)
+        return _format_catalogue_error(exc, "get_catalogue_specimen")
 
 
 @mcp.tool()
@@ -1520,11 +2133,11 @@ async def search_catalogue(query: str, limit: int = 20) -> str:
             "/api/v1/blackdome/intelligence/catalogue/search",
             {"query": query, "limit": limit},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, _CATALOGUE_SEARCH_MAX))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_catalogue_error(exc)
+        return _format_catalogue_error(exc, "search_catalogue")
 
 
 @mcp.tool()
@@ -1549,11 +2162,11 @@ async def recent_catalogue_specimens(limit: int = 20, offset: int = 0, kind: Opt
             "/api/v1/blackdome/intelligence/catalogue/recent",
             {"limit": limit, "offset": offset, "kind": kind},
         )
-        return json.dumps(payload, indent=2, default=str)
+        return _dump(_say_if_more(payload, limit, _CATALOGUE_RECENT_MAX, offset_param="offset", offset=offset))
     except _CustomerIntelligenceValidationError:
         return _validation_error()
     except Exception as exc:
-        return _format_catalogue_error(exc)
+        return _format_catalogue_error(exc, "recent_catalogue_specimens")
 
 
 # ---------------------------------------------------------------------------
@@ -1572,7 +2185,7 @@ def main():
             "credential_preview, verify_sigil, recent_iocs, ioc_trends, and "
             "json/csv export_iocs) will work, but paid tools "
             "(search_credentials, credential_stats, list_payloads, get_actor, "
-            "warboard, list_notable_sessions, get_session_transcript, "
+            "explain_ioc, list_notable_sessions, get_session_transcript, "
             "list_detonations, get_detonation_report, get_artifact, whoami, "
             "the specimen catalogue tools, and stix export) will return 401. "
             "Get a key at https://blackdome.ai/pricing.",

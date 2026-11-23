@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.5.3 - 2026-11-23
+
+One tool was removed: the warboard tool (the warboard was retired on 20 November 2026 and its API route now answers 410). No other tool was added, removed or renamed (30 tools). What a tool answers changed:
+
+- Refusals name the plan and its price. A tool your key's plan does not include,
+  a call with no key, or a key the service does not accept is answered with one
+  sentence naming the plan that includes the tool, its monthly price, its free
+  trial and https://blackdome.ai/pricing, for example "list_payloads needs
+  Threat Intel Analyst (US$99 a month, 14-day free trial) or higher." The hosted
+  server says to send the key as a header; the local package says how to set
+  `BLACKDOME_API_KEY`. An expired key, an inactive account or a missing scope
+  still says so instead.
+- Failures are failures: a refusal, an error from the service, a timeout or an
+  invalid argument is a failed tool call (`isError: true`), not a result.
+- A wrong key is refused on every tool, the free ones included; it never
+  quietly gets the free answers. Remove the key to use the free tools.
+- Timeouts: one answer is waited for up to 45 seconds (was 15), and a timeout
+  says "The BlackDome API did not answer within 45 seconds. Try again."
+- Evidence records: `explain_ioc` gives the indicator, when it was first and
+  last seen, where it was seen, what it links to and its newest evidence
+  records; a miss says "No evidence record for this indicator." (not a failure).
+- Every list tool takes a `limit` with a default and a maximum and says when
+  there is more (`export_iocs` gains `limit`; `get_detonation_report` and
+  `get_artifact` take `ioc_limit`; `get_catalogue_family` takes
+  `timeline_limit`). Every time leaves in UTC with a `Z`.
+- Corrected the plan wording for `list_notable_sessions` and
+  `get_session_transcript`. The indicator tool describes its answer as an
+  evidence record.
+- An id placed in a request path (sigil, actor, session, detonation, sha256)
+  must be a plain id; anything else is refused with no request made.
+- Hosted server (https://api.blackdome.ai/mcp, `blackdome-mcp-http`): each tool
+  call uses the key on the HTTP request that carried it (never one remembered
+  from the session); a keyless request on a session begun with a key is refused
+  (401, carrying the request's JSON-RPC id); the daily-limit numbers are passed
+  on as RateLimit-* headers and, when a tenth or less is left, as a note in the
+  result; it calls the API on the same machine, so each caller without a key
+  is counted as itself.
+- If you run `blackdome-mcp-http` yourself, set
+  `BLACKDOME_BASE_URL=https://api.blackdome.ai`: that entry point now defaults
+  to `http://127.0.0.1:7860` (the stdio `blackdome-mcp` still defaults to
+  `https://api.blackdome.ai`).
+
 ## 0.5.2 - 2026-11-17
 
 - No tool was added, removed or renamed, and no request sent to the service
@@ -45,9 +87,8 @@
   ThreatDrop API) and which plan each tool needs. The earlier "candidate
   Enterprise/OEM pilot" and "Pro or higher" wording is gone; Enterprise is
   "talk to us".
-- `list_payloads`, `get_actor` and `warboard` need Threat Intel Analyst or
-  Pro. The service now checks this: API access on another plan no longer
-  unlocks them.
+- `list_payloads` and `get_actor` need Threat Intel Analyst or Pro.
+  The service checks the plan for both tools.
 - The session tools (`list_notable_sessions`, `get_session_transcript`) are
   described as needing `session_intel`, which no plan on sale includes.
 - A rate-limit error states a retry time only when the service sent one

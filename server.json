@@ -8,20 +8,20 @@
     "url": "https://github.com/blackdome-ai/blackdome-mcp",
     "source": "github"
   },
-  "version": "0.5.2",
+  "version": "0.5.3",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "blackdome-mcp",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "BLACKDOME_API_KEY",
-          "description": "Optional Bearer API key. Free public tools work without it; paid tiers (credential intel, payloads, actors, warboard, STIX export) require a key. Get one at https://blackdome.ai/pricing",
+          "description": "Optional Bearer API key. Free public tools work without it; paid tiers (credential intel, payloads, actors, evidence records, STIX export) require a key. Get one at https://blackdome.ai/pricing",
           "isRequired": false,
           "isSecret": true
         },
@@ -33,9 +33,9 @@
         },
         {
           "name": "BLACKDOME_TIMEOUT",
-          "description": "HTTP request timeout in seconds (default 15). Increase for large STIX/CSV exports.",
+          "description": "Seconds to wait for one API answer (default 45).",
           "isRequired": false,
-          "default": "15"
+          "default": "45"
         }
       ]
     }

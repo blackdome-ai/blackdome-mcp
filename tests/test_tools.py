@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _RELEASE_GATE_SCRIPT = _PACKAGE_ROOT / "scripts/check_release_artifact.py"
-_RELEASE_VERSION = "0.5.2"
+_RELEASE_VERSION = "0.5.3"
 _CANONICAL_SERVER_NAME = "io.github.blackdome-ai/blackdome-mcp"
 _RELEASE_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -49,7 +49,6 @@ _RELEASE_TOOL_NAMES = (
     "credential_stats",
     "list_payloads",
     "get_actor",
-    "warboard",
     "list_notable_sessions",
     "get_session_transcript",
     "list_detonations",
@@ -82,7 +81,6 @@ _README_TOOL_NAMES = (
     "credential_stats",
     "list_payloads",
     "get_actor",
-    "warboard",
     "list_notable_sessions",
     "get_session_transcript",
     "list_detonations",
@@ -168,12 +166,12 @@ def test_mcp_initialize_advertises_the_canonical_package_version():
     assert initialization.server_version == _RELEASE_VERSION
 
 
-def test_release_tool_contract_has_exactly_31_source_and_documented_tools():
-    """The immutable 0.5.2 release must not gain, lose, or rename a tool."""
+def test_release_tool_contract_has_exactly_30_source_and_documented_tools():
+    """The immutable 0.5.3 release must not gain, lose, or rename a tool."""
     assert _decorated_tool_names() == _RELEASE_TOOL_NAMES
     assert _readme_tool_names() == _README_TOOL_NAMES
     assert set(_README_TOOL_NAMES) == set(_RELEASE_TOOL_NAMES)
-    assert len(_RELEASE_TOOL_NAMES) == 31
+    assert len(_RELEASE_TOOL_NAMES) == 30
 
 
 def _run_release_artifact_gate(
@@ -610,8 +608,8 @@ async def test_customer_intelligence_and_catalogue_tools_never_say_retry_after_q
     ("Tenant account is inactive", "this BlackDome account is inactive", True),
     ("Insufficient scope: requires 'read'", "does not have the scope", True),
     ("This endpoint needs a Threat Intel plan (Analyst or Pro). Current plan: threatdrop_pro",
-     "need Threat Intel Analyst or Pro", False),
-    ("Feature 'api_access' requires a higher plan. Current plan: free", "your plan does not include the feature", False),
+     "list_payloads needs Threat Intel Analyst (US$99 a month, 14-day free trial) or higher", False),
+    ("Feature 'api_access' requires a higher plan. Current plan: free", "Your plan does not include list_payloads.", False),
 ])
 async def test_access_denied_names_the_real_cause(detail, says, not_plan):
     def handler(request):
@@ -620,7 +618,7 @@ async def test_access_denied_names_the_real_cause(detail, says, not_plan):
     with mock_api(handler):
         out = await server.list_payloads()
     assert out.startswith("Access denied (403): ") and says in out and out.endswith(f"Server said: {detail}")
-    assert ("your plan does not include" not in out) == not_plan
+    assert ("plan does not include" not in out) == not_plan
 
 
 def test_every_gated_tool_description_names_a_plan_on_sale_or_says_none_does():
@@ -630,11 +628,11 @@ def test_every_gated_tool_description_names_a_plan_on_sale_or_says_none_does():
     tools = {tool.name: (tool.description or "") for tool in asyncio.run(server.mcp.list_tools())}
     expect = {
         "list_payloads": "Threat Intel Analyst or Pro", "get_actor": "Threat Intel Analyst or Pro",
-        "warboard": "Threat Intel Analyst or Pro", "explain_ioc": "Threat Intel Analyst or Pro",
+        "explain_ioc": "Threat Intel Analyst or Pro",
         "search_credentials": "Credential Intelligence", "credential_stats": "Credential Intelligence",
         "list_detonations": "Threat Intel Pro", "get_detonation_report": "Threat Intel Pro",
         "get_artifact": "Threat Intel Pro",
-        "list_notable_sessions": "no plan on sale includes", "get_session_transcript": "no plan on sale includes",
+        "list_notable_sessions": "Threat Intel Analyst or Pro", "get_session_transcript": "no plan on sale includes",
     }
     for name, phrase in expect.items():
         assert phrase in tools[name], (name, tools[name][:160])
@@ -727,13 +725,18 @@ async def test_get_session_transcript_quotes_path_and_clamps_limit():
             }
         )
 
+    # A value that is not a plain id never reaches a path (D6: the hosted server calls the API on loopback).
     with mock_api(handler) as captured:
-        await server.get_session_transcript("sess/with space", limit=5000, offset=7)
+        refused = await server.get_session_transcript("sess/with space", limit=5000, offset=7)
+    assert refused == "Invalid request parameters." and captured == []
+
+    with mock_api(handler) as captured:
+        await server.get_session_transcript("acc23b6930b2405b:391b7394", limit=5000, offset=7)
 
     url = captured[0].url
     assert (
         url.raw_path.decode()
-        == "/api/v1/blackdome/intel/sessions/sess%2Fwith%20space/transcript?limit=1000&offset=7"
+        == "/api/v1/blackdome/intel/sessions/acc23b6930b2405b%3A391b7394/transcript?limit=1000&offset=7"
     )
     assert url.params["limit"] == "1000"
     assert url.params["offset"] == "7"
@@ -776,12 +779,13 @@ async def test_get_detonation_report_quotes_path():
         )
 
     with mock_api(handler) as captured:
-        await server.get_detonation_report("det/with space")
+        refused = await server.get_detonation_report("det/with space")
+    assert refused == "Invalid request parameters." and captured == []
 
-    assert (
-        captured[0].url.raw_path.decode()
-        == "/api/v1/blackdome/intel/detonations/det%2Fwith%20space"
-    )
+    with mock_api(handler) as captured:
+        await server.get_detonation_report("job:0f96a06e")
+
+    assert captured[0].url.raw_path.decode() == "/api/v1/blackdome/intel/detonations/job%3A0f96a06e"
 
 
 @pytest.mark.asyncio
@@ -809,9 +813,13 @@ async def test_get_artifact_quotes_path_and_does_not_return_transcript_fields():
         )
 
     with mock_api(handler) as captured:
-        out = await server.get_artifact("c/with space")
+        refused = await server.get_artifact("c/with space")
+    assert refused == "Invalid request parameters." and captured == []
 
-    assert captured[0].url.raw_path.decode() == "/api/v1/blackdome/intel/artifacts/c%2Fwith%20space"
+    with mock_api(handler) as captured:
+        out = await server.get_artifact("c" * 64)
+
+    assert captured[0].url.raw_path.decode() == "/api/v1/blackdome/intel/artifacts/" + "c" * 64
     assert '"command":' not in out
     assert '"output_preview":' not in out
 
@@ -1372,13 +1380,13 @@ async def test_catalogue_errors_are_explicit_without_echoing_the_server_detail(s
 @pytest.mark.parametrize(
     "detail, expected",
     [
-        ("Feature requires a higher plan", "needs Threat Intel Pro (feature genome_clusters)"),
+        ("Feature requires a higher plan", "get_catalogue_specimen needs Threat Intel Pro (US$299 a month, 14-day free trial)"),
         ("Subscription inactive", "subscription on this key's account is not active"),
-        ("Insufficient scope: requires 'read'", "does not have the read scope"),
+        ("Insufficient scope: requires 'read'", "does not have the scope this tool needs"),
         ("API key has expired", "this API key has expired"),
         ("Tenant account is inactive", "this BlackDome account is inactive"),
-        ("SERVER_DETAIL_SENTINEL", "needs Threat Intel Pro (feature genome_clusters)"),
-        (["not", "a", "string"], "needs Threat Intel Pro (feature genome_clusters)"),
+        ("SERVER_DETAIL_SENTINEL", "get_catalogue_specimen needs Threat Intel Pro (US$299 a month, 14-day free trial)"),
+        (["not", "a", "string"], "get_catalogue_specimen needs Threat Intel Pro (US$299 a month, 14-day free trial)"),
     ],
 )
 async def test_catalogue_403_says_why_without_relaying_the_server_text(detail, expected):
@@ -1404,7 +1412,7 @@ async def test_catalogue_403_with_a_non_json_body_gets_the_generic_hint():
         out = await server.recent_catalogue_specimens()
 
     assert out.startswith("Access denied (403): ")
-    assert "needs Threat Intel Pro (feature genome_clusters)" in out
+    assert "recent_catalogue_specimens needs Threat Intel Pro (US$299 a month, 14-day free trial)" in out
     assert "SERVER_DETAIL_SENTINEL" not in out and "<html>" not in out
 
 

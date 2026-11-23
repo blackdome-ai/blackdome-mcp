@@ -27,3 +27,9 @@ def test_registry_description_fits_the_registry_validation_contract():
     # Registry /validate rejected the original manifest with description >100.
     manifest = json.loads((Path(__file__).resolve().parents[1] / "server.json").read_text())
     assert 1 <= len(manifest["description"]) <= 100
+
+
+def test_readme_points_legacy_registry_users_to_the_current_name():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert "The old registry name `io.github.blackdome-ai/blackdome` is deprecated." in readme
+    assert "Use `io.github.blackdome-ai/blackdome-mcp`." in readme
