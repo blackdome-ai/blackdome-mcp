@@ -22,6 +22,12 @@ LIMIT_HEADERS = {
 DAILY_SENTENCE = "Daily request limit reached: BlackDome Free allows 100 requests a day."
 
 
+@pytest.fixture(autouse=True)
+def _fresh_allowance_cache(monkeypatch):
+    """The hosted server keeps each key's last allowance headers for a few seconds; no test sees another's."""
+    monkeypatch.setattr(server, "_ALLOWANCE_CACHE", server.OrderedDict())
+
+
 def _mcp_headers(key, session_id=None):
     headers = {
         "Accept": "application/json, text/event-stream",
@@ -176,6 +182,8 @@ async def test_hosted_limits_follow_the_current_call_key_and_ignore_inbound_limi
     inbound = {name: "123" for name in LIMIT_HEADERS}
 
     def handler(request):
+        if request.url.path == server.ALLOWANCES_PATH:
+            return httpx.Response(200, json={})       # the initialize answers' own allowance read
         assert request.headers["Authorization"] == "Bearer bd_current_customer_key"
         assert all(name not in request.headers for name in inbound)
         if accepted:
@@ -190,3 +198,249 @@ async def test_hosted_limits_follow_the_current_call_key_and_ignore_inbound_limi
         assert {name: answer.headers.get(name) for name in LIMIT_HEADERS} == LIMIT_HEADERS
     else:
         assert all(name not in answer.headers for name in LIMIT_HEADERS)
+
+
+# Walkthrough 2026-11-23, item 13: every hosted answer to a keyed request carries the REST API's full header set,
+# per-minute and daily, including the answers that make no API call of their own.
+FULL_SET = {
+    **LIMIT_HEADERS,
+    "X-RateLimit-Minute-Limit": "60",
+    "X-RateLimit-Minute-Remaining": "41",
+    "X-RateLimit-Minute-Reset": "17",
+}
+
+
+@pytest.mark.asyncio
+async def test_every_hosted_keyed_answer_carries_the_full_set(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.setattr(server, "_ALLOWANCE_CACHE", server.OrderedDict())
+    monkeypatch.setattr(server.mcp, "_session_manager", None)
+    allowance_reads = []
+
+    def handler(request):
+        if request.url.path == server.ALLOWANCES_PATH:
+            allowance_reads.append(request)
+            if request.headers.get("authorization") != "Bearer bd_customer_key":
+                return httpx.Response(401, json={"detail": "Invalid API key"})
+            return httpx.Response(200, json={}, headers=FULL_SET)
+        return httpx.Response(200, json={"items": [], "count": 0},
+                              headers={**FULL_SET, "X-RateLimit-Minute-Remaining": "40"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", _factory)
+    app = create_http_app()
+    async with _LifespanDriver(app):
+        async with real_client(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init = await client.post("/mcp", headers=_mcp_headers("bd_customer_key"), json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1.0"}},
+            })
+            session_id = init.headers["mcp-session-id"]
+            initialized = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id),
+                                            json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+            listed = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id),
+                                       json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            called = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id), json={
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "top_attackers", "arguments": {"days": 1}},
+            })
+            wrong = await client.post("/mcp", headers=_mcp_headers("bd_wrong_key_value"), json={
+                "jsonrpc": "2.0", "id": 4, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1.0"}},
+            })
+
+    for answer in (init, initialized, listed):
+        for name, value in FULL_SET.items():
+            assert answer.headers.get(name) == value, (answer.request.content[:60], name)
+    # The tool call reports the window its own API call was answered with, not a separate read.
+    assert called.headers.get("X-RateLimit-Minute-Remaining") == "40"
+    assert all(name in called.headers for name in FULL_SET)
+    # One read for the session's first answer; the notification and the tool list reuse it (review 2026-11-23).
+    # The wrong key is a key of its own: its read is refused and nothing is kept for it.
+    assert len(allowance_reads) == 2
+    assert not any("ratelimit" in name.lower() for name in wrong.headers)
+
+
+@pytest.mark.asyncio
+async def test_hosted_answers_reuse_the_last_values_for_a_few_seconds(monkeypatch):
+    """Review 2026-11-23: each answer that made no tool call read /limits, a key check on the API each time, and
+    a key past that read's own ceiling of 120 a minute got answers with no headers."""
+    monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.setattr(server.mcp, "_session_manager", None)
+    monkeypatch.setattr(server, "_ALLOWANCE_CACHE", server.OrderedDict())
+    clock = [1000.0]
+    monkeypatch.setattr(server, "_allowance_clock", lambda: clock[0])
+    allowance_reads = []
+
+    def handler(request):
+        if request.url.path == server.ALLOWANCES_PATH:
+            allowance_reads.append(request)
+            return httpx.Response(200, json={}, headers=FULL_SET)
+        return httpx.Response(200, json={"items": [], "count": 0},
+                              headers={**FULL_SET, "X-RateLimit-Minute-Remaining": "40"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", _factory)
+    app = create_http_app()
+    async with _LifespanDriver(app):
+        async with real_client(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init = await client.post("/mcp", headers=_mcp_headers("bd_customer_key"), json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1.0"}},
+            })
+            session_id = init.headers["mcp-session-id"]
+            await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id), json={
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "top_attackers", "arguments": {"days": 1}},
+            })
+            clock[0] += 2
+            # The tool call's own values, two seconds older: no read, the reset counts aged by two seconds.
+            listed = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id),
+                                       json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+            assert len(allowance_reads) == 1
+            assert listed.headers.get("X-RateLimit-Minute-Remaining") == "40"
+            assert listed.headers.get("X-RateLimit-Minute-Reset") == "15"
+            assert listed.headers.get("RateLimit-Reset") == "3718"
+            clock[0] += server.ALLOWANCE_CACHE_SECONDS
+            # Older than the reuse window: read again.
+            relisted = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id),
+                                         json={"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
+            assert len(allowance_reads) == 2
+            assert relisted.headers.get("X-RateLimit-Minute-Remaining") == "41"
+
+
+def test_kept_values_are_dropped_when_a_window_rolls_over(monkeypatch):
+    monkeypatch.setattr(server, "_ALLOWANCE_CACHE", server.OrderedDict())
+    clock = [50.0]
+    monkeypatch.setattr(server, "_allowance_clock", lambda: clock[0])
+    server.remember_allowances("bd_customer_key", {**FULL_SET, "X-RateLimit-Minute-Reset": "2"})
+    assert server._cached_allowances("bd_customer_key")["X-RateLimit-Minute-Reset"] == "2"
+    assert server._cached_allowances("bd_other_key_value") is None
+    clock[0] += 2
+    # The minute window has rolled over, so its remaining count is no longer true.
+    assert server._cached_allowances("bd_customer_key") is None
+    # The key itself is never kept.
+    assert all("bd_customer_key" not in ident for ident in server._ALLOWANCE_CACHE)
+
+
+# Second review 2026-11-23, finding 2: (a) when the allowance read itself is refused with a 429, that answer carries the
+# key's full set (the API attaches it to every answer to a valid key) and the hosted answer passed none on; (b) a plan
+# with a per-minute limit and no daily limit (OEM) gets the minute set from the API and the hosted answers got none.
+def _plan_set(daily, per_minute, *, minute_remaining="41"):
+    values = {
+        "X-RateLimit-Minute-Limit": str(per_minute),
+        "X-RateLimit-Minute-Remaining": minute_remaining,
+        "X-RateLimit-Minute-Reset": "17",
+    }
+    if daily is None:
+        values["RateLimit-Policy"] = f"{per_minute};w=60"
+    else:
+        values.update({"RateLimit-Limit": str(daily), "RateLimit-Remaining": str(daily - 7),
+                       "RateLimit-Reset": "3720", "RateLimit-Policy": f"{daily};w=86400, {per_minute};w=60"})
+    return values
+
+
+PLAN_SETS = {
+    "analyst": (5000, 60),
+    "analyst-trialing": (5000, 60),
+    "pro": (50000, 300),
+    "pro-trialing": (50000, 300),
+    "oem": (None, 5000),
+}
+
+
+async def _hosted_session(monkeypatch, handler):
+    monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.setattr(server.mcp, "_session_manager", None)
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", _factory)
+    app = create_http_app()
+    async with _LifespanDriver(app):
+        async with real_client(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            init = await client.post("/mcp", headers=_mcp_headers("bd_customer_key"), json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1.0"}},
+            })
+            session_id = init.headers["mcp-session-id"]
+            called = await client.post("/mcp", headers=_mcp_headers("bd_customer_key", session_id), json={
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "top_attackers", "arguments": {"days": 1}},
+            })
+    return init, called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", sorted(PLAN_SETS))
+async def test_a_refused_allowance_read_still_passes_its_headers_on(monkeypatch, plan):
+    daily, per_minute = PLAN_SETS[plan]
+    refused = {**_plan_set(daily, per_minute), "Retry-After": "17"}
+
+    def handler(request):
+        if request.url.path == server.ALLOWANCES_PATH:
+            return httpx.Response(429, json={"detail": "Too many reads of your allowances in a minute."},
+                                  headers=refused)
+        return httpx.Response(200, json={"items": [], "count": 0}, headers=_plan_set(daily, per_minute))
+
+    init, _ = await _hosted_session(monkeypatch, handler)
+    for name, value in _plan_set(daily, per_minute).items():
+        assert init.headers.get(name) == value, name
+    assert "retry-after" not in {name.lower() for name in init.headers}     # the read's refusal is not the answer's
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", sorted(PLAN_SETS))
+async def test_every_plan_gets_its_own_set_on_hosted_answers(monkeypatch, plan):
+    daily, per_minute = PLAN_SETS[plan]
+
+    def handler(request):
+        if request.url.path == server.ALLOWANCES_PATH:
+            return httpx.Response(200, json={}, headers=_plan_set(daily, per_minute))
+        return httpx.Response(200, json={"items": [], "count": 0},
+                              headers=_plan_set(daily, per_minute, minute_remaining="40"))
+
+    init, called = await _hosted_session(monkeypatch, handler)
+    for answer, remaining in ((init, "41"), (called, "40")):
+        expected = _plan_set(daily, per_minute, minute_remaining=remaining)
+        assert {name: answer.headers.get(name) for name in expected} == expected
+        if daily is None:
+            assert "ratelimit-limit" not in {name.lower() for name in answer.headers}
+    # A minute-only set is no daily limit: the tool result gets no daily-limit note.
+    content = _sse_result(called.text)["result"]["content"]
+    assert not any(server.LIMIT_META_KEY in (item.get("_meta") or {}) for item in content)
+
+
+def test_a_minute_only_answer_never_makes_a_daily_note():
+    response = httpx.Response(429, json={"detail": "Rate limit exceeded"}, headers=_plan_set(None, 5000))
+    info = server._limit_from_response(response)
+    assert info["headers"] == _plan_set(None, 5000)
+    assert info["limit"] is None and info["remaining"] is None
+    assert server._limit_note(info) is None
+    holder = {}
+    server._keep_lowest(holder, info)
+    daily = server._limit_from_response(httpx.Response(200, headers=_plan_set(5000, 60)))
+    server._keep_lowest(holder, daily)
+    assert holder["info"] is daily                      # a daily set replaces a minute-only one
+    server._keep_lowest(holder, info)
+    assert holder["info"] is daily                      # and is never replaced by one

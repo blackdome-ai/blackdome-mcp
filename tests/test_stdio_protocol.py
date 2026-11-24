@@ -29,7 +29,6 @@ CASES = [
     ("attack_map", {"limit": 1}, "GET", "/api/blackdome/map/events", {"limit": "10"}),
     ("attack_heatmap", {"limit": 1}, "GET", "/api/blackdome/map/heatmap", {"limit": "5"}),
     ("credential_preview", {"limit": 99, "hours": 99}, "GET", "/api/blackdome/credentials/preview", {"limit": "25", "hours": "24"}),
-    ("verify_sigil", {"sigil_id": "fixture-sigil"}, "GET", "/api/blackdome/audit/fixture-sigil", {}),
     ("recent_iocs", {"ioc_type": "ipv4", "severity": "high", "limit": 2}, "GET", "/api/blackdome/iocs/public", {"ioc_type": "ipv4", "severity": "high", "limit": "2"}),
     ("ioc_trends", {"days": 2}, "GET", "/api/blackdome/iocs/public/trends", {"days": "2"}),
     ("export_iocs", {}, "GET", BASE + "/threat-intel/feed/json", {"min_confidence": "50", "min_severity": "medium", "days": "30"}),
@@ -159,10 +158,10 @@ def test_installed_stdio_all_tools(mode, tmp_path):
                 async with stdio_client(params, errlog=stderr) as (read, write):
                     async with ClientSession(read, write) as client:
                         initialized = await client.initialize()
-                        assert initialized.serverInfo.version == "0.5.3"
+                        assert initialized.serverInfo.version == "0.5.4"
                         listed = await client.list_tools()
                         assert {t.name for t in listed.tools} == {case[0] for case in CASES}
-                        assert len(listed.tools) == 30
+                        assert len(listed.tools) == 29
                         for case in CASES:
                             state["case"] = case
                             state["requests"].clear()
@@ -185,12 +184,12 @@ def test_installed_stdio_all_tools(mode, tmp_path):
                             assert request["accept"] == ("text/csv" if case[1].get("fmt") == "csv" else "application/json")
                             refused = mode == "invalid-key" or (mode in {"keyless", "wrong-plan"} and not is_public(case))
                             not_found_answer = mode == "404" and case[0] in {
-                                "lookup_attacker_ip", "verify_sigil", "explain_ioc", "get_threatdrop_case", "get_takedown_status"}
+                                "lookup_attacker_ip", "explain_ioc", "get_threatdrop_case", "get_takedown_status"}
                             failed = (refused or mode in {"429", "404", "500"} or (mode == "malformed" and case[1].get("fmt") != "csv"))
                             assert result.isError == (failed and not not_found_answer), (mode, case[0], text)
                             if refused or mode in {"429", "404", "500"}:
                                 status = "401" if mode in {"invalid-key", "keyless"} else "403" if mode == "wrong-plan" else mode
-                                if mode == "404" and case[0] in {"lookup_attacker_ip", "verify_sigil"}:
+                                if mode == "404" and case[0] == "lookup_attacker_ip":
                                     assert json.loads(text)["found"] is False
                                 elif mode == "404" and case[0] == "explain_ioc":
                                     assert text == "No evidence record for this indicator."

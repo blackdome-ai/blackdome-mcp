@@ -73,7 +73,6 @@ def test_the_allowlist_in_the_code_is_nginxs():
 
 HOSTILE = ["", ".", "..", "%2e%2e", "a/b", "../me", "a?b=1", "a#b", "a%2Fb", "-x", " x", "x\n", "é", "a" * 300]
 PATH_TOOLS = [
-    ("verify_sigil", "sigil_id", {}),
     ("list_payloads", "sha256", {}),
     ("get_actor", "actor_id", {}),
     ("get_session_transcript", "session_id", {}),
@@ -108,7 +107,6 @@ def test_export_format_is_one_of_three():
     ("get_detonation_report", {"detonation_id": "job:0f96a06e"}, "/api/v1/blackdome/intel/detonations/job%3A0f96a06e"),
     ("get_session_transcript", {"session_id": "acc23b6930b2405b_391b7394"},
      "/api/v1/blackdome/intel/sessions/acc23b6930b2405b_391b7394/transcript"),
-    ("verify_sigil", {"sigil_id": "SIGIL-EEEB0646"}, "/api/blackdome/audit/SIGIL-EEEB0646"),
     ("lookup_attacker_ip", {"ip": "2001:db8::1"}, "/api/blackdome/lookup/2001%3Adb8%3A%3A1"),
     ("lookup_attacker_ip", {"ip": "::1"}, "/api/blackdome/lookup/%3A%3A1"),
 ])

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4 - 2026-11-23
+
+Removed `verify_sigil`, which checked records from a retired archive. No other tool changed (29 tools).
+
+Hosted endpoint: answers to a request with a valid key carry the API's rate-limit headers, the daily and the
+per-minute ones, including answers that run no tool, whenever the API's allowances can be read. A key on a plan with no daily limit gets the per-minute headers.
+A tool result never gets a daily-limit note for such a key.
+
 ## 0.5.3 - 2026-11-23
 
 One tool was removed: the warboard tool (the warboard was retired on 20 November 2026 and its API route now answers 410). No other tool was added, removed or renamed (30 tools). What a tool answers changed:

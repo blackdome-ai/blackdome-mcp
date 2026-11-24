@@ -6,7 +6,7 @@ Canonical MCP server name: `io.github.blackdome-ai/blackdome-mcp`
 
 The old registry name `io.github.blackdome-ai/blackdome` is deprecated. Use `io.github.blackdome-ai/blackdome-mcp`.
 
-Package version: `0.5.3`
+Package version: `0.5.4`
 
 Give your AI agents direct access to **read-only observed threat intelligence**. Look up attacker IPs, browse indicators of compromise (IOCs), inspect captured credentials and malware payloads, compare samples deterministically, inspect bounded evidence clusters, and retrieve authenticated ThreatDrop case and workflow status — all from Claude, Cursor, or any MCP-compatible client.
 
@@ -127,7 +127,6 @@ Free tools work with no key. Paid tools require an API key whose plan includes t
 | `attack_map` | **Free** | Recent geolocated attack events for a live map (limit ≥ 10) |
 | `attack_heatmap` | **Free** | Country-aggregated attack heatmap with centroids (limit ≥ 5) |
 | `credential_preview` | **Free** | Sample of recent credentials (masked server-side) + teaser totals |
-| `verify_sigil` | **Free** | Verify a BlackDome Sigil / audit record by id |
 | `recent_iocs` | **Free** | Browse recent redacted IOCs — type/severity filters (72h community delay, 25-row cap) |
 | `ioc_trends` | **Free** | Aggregated IOC trends — totals, breakdowns, daily new, top MITRE |
 | `export_iocs` | **Free** (json/csv) · **Pro** (stix) | Export the IOC feed; STIX bundle needs the `stix_export` feature |

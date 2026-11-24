@@ -45,7 +45,6 @@ TOOL_ACCESS: dict[str, object] = {
     "attack_map": FREE,
     "attack_heatmap": FREE,
     "credential_preview": FREE,
-    "verify_sigil": FREE,
     "recent_iocs": FREE,
     "ioc_trends": FREE,
     "export_iocs": FREE,            # json and csv; STIX is "export_iocs:stix" below

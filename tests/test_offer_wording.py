@@ -35,6 +35,17 @@ def test_retired_warboard_is_absent_from_the_tool_list_and_customer_docs():
         assert "warboard" not in text.lower(), name
 
 
+def test_retired_intrusion_records_are_absent_from_the_tool_list_and_customer_docs():
+    tools = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+    assert "verify_sigil" not in tools
+    assert len(tools) == 29
+    for name, text in TEXTS.items():
+        if name == "CHANGELOG.md":
+            continue
+        assert "sigil" not in text.lower(), name
+        assert "intrusion" not in text.lower(), name
+
+
 def test_tool_descriptions_and_the_denial_sentence_use_the_offers_words():
     tools = {tool.name: tool.description for tool in asyncio.run(server.mcp.list_tools())}
     assert tools["explain_ioc"].startswith("An evidence record for an indicator in our malware graph")

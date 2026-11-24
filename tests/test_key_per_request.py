@@ -40,6 +40,9 @@ async def _session(monkeypatch, steps, *, init_key):
         # A sent key is first checked on /me (test_wrong_key.py); only the tool's own call is recorded here.
         if request.url.path == "/api/v1/blackdome/me":
             return httpx.Response(200, json={})
+        # The uncounted allowance read behind the headers of answers that make no API call (not a tool call).
+        if request.url.path == server.ALLOWANCES_PATH:
+            return httpx.Response(200, json={})
         upstream.append(request.headers.get("Authorization"))
         return httpx.Response(200, json={"items": [], "count": 0})
 

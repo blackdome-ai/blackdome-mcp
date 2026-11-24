@@ -136,6 +136,12 @@ mcp = FastMCP(
 #     (blackdome_mcp.http_server.LimitHeaders).
 
 LIMIT_HEADERS = ("RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset", "RateLimit-Policy")
+# The per-minute window, passed on with the daily headers (walkthrough 2026-11-23, item 13: the hosted answers
+# carried the daily headers only, and only on a tool call).
+MINUTE_LIMIT_HEADERS = ("X-RateLimit-Minute-Limit", "X-RateLimit-Minute-Remaining", "X-RateLimit-Minute-Reset")
+# The API's uncounted read of a key's allowances, for hosted answers that make no API call of their own.
+ALLOWANCES_PATH = "/api/v1/blackdome/limits"
+ALLOWANCES_TIMEOUT_SECONDS = 3.0
 LIMIT_META_KEY = "blackdome.ai/daily_limit"
 # Where the hosted transport's middleware leaves a dict for this HTTP request's limit (scope["state"][...]).
 LIMIT_STATE_KEY = "blackdome_daily_limit"
@@ -144,14 +150,24 @@ _CALL_LIMIT: ContextVar[Optional[dict]] = ContextVar("blackdome_mcp_call_limit",
 
 
 def _limit_from_response(resp: Any) -> Optional[dict]:
-    """The daily limit an API answer states, or None when it states none (a keyless or public answer)."""
+    """The allowances an API answer states, or None when it states none (a keyless or public answer).
+
+    A plan with a per-minute limit and no daily limit is answered with RateLimit-Policy and the minute headers
+    only (second review 2026-11-23, finding 2): that set is passed on too, with ``limit`` and ``remaining`` None, so
+    it never makes a daily-limit note."""
     headers = getattr(resp, "headers", None)
     if headers is None:
         return None
     values = {name: str(headers.get(name, "")).strip() for name in LIMIT_HEADERS}
+    minute = {name: str(headers.get(name, "")).strip() for name in MINUTE_LIMIT_HEADERS}
+    minute = {name: value for name, value in minute.items() if value.isdigit()}
     if not values["RateLimit-Limit"].isdigit() or not values["RateLimit-Remaining"].isdigit():
-        return None
+        if "X-RateLimit-Minute-Limit" not in minute or "X-RateLimit-Minute-Remaining" not in minute:
+            return None
+        policy = {"RateLimit-Policy": values["RateLimit-Policy"]} if values["RateLimit-Policy"] else {}
+        return {"headers": {**policy, **minute}, "limit": None, "remaining": None, "reset_seconds": None}
     info: dict[str, Any] = {"headers": {k: v for k, v in values.items() if v}}
+    info["headers"].update(minute)
     info["limit"] = int(values["RateLimit-Limit"])
     info["remaining"] = int(values["RateLimit-Remaining"])
     info["reset_seconds"] = int(values["RateLimit-Reset"]) if values["RateLimit-Reset"].isdigit() else None
@@ -168,7 +184,13 @@ def _keep_lowest(holder: Optional[dict], info: dict) -> None:
     if holder is None:
         return
     current = holder.get("info")
-    if current is None or info["remaining"] <= current["remaining"] or info.get("detail"):
+    if current is None:
+        holder["info"] = info
+    elif info["remaining"] is None:
+        # A minute-only set (no daily limit) never replaces a daily one; between two, the later is the fresher.
+        if current["remaining"] is None:
+            holder["info"] = info
+    elif current["remaining"] is None or info["remaining"] <= current["remaining"] or info.get("detail"):
         holder["info"] = info
 
 
@@ -194,6 +216,88 @@ def _record_limit(resp: Any) -> None:
     _keep_lowest(_request_limit_holder(), info)
 
 
+# Hosted mode: the allowance headers last seen per key, so answers that make no API call reuse them instead of
+# reading /limits each time (review 2026-11-23: a session start was three reads, each a key check on the API, and
+# that read has limits of its own, by address, key prefix and key). Keyed by a digest of the key, never the key itself.
+ALLOWANCE_CACHE_SECONDS = 5.0
+ALLOWANCE_CACHE_MAX_KEYS = 4096
+_RESET_HEADERS = ("RateLimit-Reset", "X-RateLimit-Minute-Reset")
+_ALLOWANCE_CACHE: "OrderedDict[str, tuple[float, dict[str, str]]]" = OrderedDict()
+
+
+def _allowance_clock() -> float:
+    return time.monotonic()
+
+
+def _allowance_cache_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def remember_allowances(key: str, values: dict[str, str]) -> None:
+    """Keep the allowance headers ``key`` was last answered with (a tool call's own API answer, or a /limits read)."""
+    if not key or not values:
+        return
+    ident = _allowance_cache_id(key)
+    _ALLOWANCE_CACHE[ident] = (_allowance_clock(), dict(values))
+    _ALLOWANCE_CACHE.move_to_end(ident)
+    while len(_ALLOWANCE_CACHE) > ALLOWANCE_CACHE_MAX_KEYS:
+        _ALLOWANCE_CACHE.popitem(last=False)
+
+
+def _cached_allowances(key: str) -> Optional[dict[str, str]]:
+    """The headers kept for ``key`` if younger than ALLOWANCE_CACHE_SECONDS, with the reset counts aged.
+
+    None when there are none, they are too old, or a window has rolled over since (its remaining count would then
+    be wrong). The remaining counts can be high by the requests made in those few seconds."""
+    entry = _ALLOWANCE_CACHE.get(_allowance_cache_id(key))
+    if entry is None:
+        return None
+    stamp, values = entry
+    age = _allowance_clock() - stamp
+    if age > ALLOWANCE_CACHE_SECONDS:
+        return None
+    aged = dict(values)
+    for name in _RESET_HEADERS:
+        value = str(aged.get(name, ""))
+        if value.isdigit():
+            left = int(value) - int(age)
+            if left <= 0:
+                return None
+            aged[name] = str(left)
+    return aged
+
+
+async def allowance_headers(key: str, client_address: Optional[str] = None) -> dict[str, str]:
+    """Hosted mode: the allowance headers for ``key`` as they stand, read without spending a request.
+
+    For an HTTP answer that made no API call (initialize, the tool list, a notification, the event stream). Values
+    this process saw for the key in the last ALLOWANCE_CACHE_SECONDS (from a tool call or an earlier read) are
+    reused; otherwise the API's GET /api/v1/blackdome/limits is read, which counts against neither allowance and
+    answers with the same headers as any keyed call. A refusal of that read (a 429 past its own ceiling) carries the
+    key's headers too and they are used (second review 2026-11-23, finding 2). Empty for no key, an invalid key, an
+    API that does not answer in time, or a read refused before the key was checked (the API's per-address and
+    per-key-prefix limits on that read), which carries none."""
+    if not key:
+        return {}
+    cached = _cached_allowances(key)
+    if cached is not None:
+        return cached
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {key}"}
+    if client_address and _base_url_is_loopback():
+        headers["X-Real-IP"] = client_address
+    try:
+        async with httpx.AsyncClient(timeout=ALLOWANCES_TIMEOUT_SECONDS) as client:
+            resp = await client.get(f"{BASE_URL}{ALLOWANCES_PATH}", headers=headers)
+    except Exception:
+        # Headers are a courtesy: a failed read never fails the answer it would have decorated.
+        return {}
+    info = _limit_from_response(resp)
+    if info is None:
+        return {}
+    remember_allowances(key, info["headers"])
+    return dict(info["headers"])
+
+
 def _limit_note_text(info: dict) -> Optional[str]:
     limit, remaining = info["limit"], info["remaining"]
     reset = info.get("reset_seconds")
@@ -211,8 +315,8 @@ def _limit_note_text(info: dict) -> Optional[str]:
 
 
 def _limit_note(info: Optional[dict]) -> Any:
-    """The note for a tool result, or None when the limit is not near."""
-    if not info:
+    """The note for a tool result, or None when the limit is not near (or the plan has no daily limit)."""
+    if not info or info.get("limit") is None or info.get("remaining") is None:
         return None
     text = _limit_note_text(info)
     if text is None:
@@ -942,31 +1046,6 @@ async def credential_preview(limit: int = 5, hours: int = 24) -> str:
         return _dump(payload)
     except Exception as exc:
         return _format_error(exc, "credential_preview")
-
-
-@mcp.tool()
-async def verify_sigil(sigil_id: str) -> str:
-    """Verify a BlackDome Sigil / audit record by its id (free).
-
-    Returns the sigil/audit verification record when the id exists. An unknown
-    or invalid id returns a clean "Sigil not found" — the tool reports that as
-    not-found rather than an error.
-
-    Args:
-        sigil_id: The sigil id to verify (e.g. "SIGIL-EEEB0646")
-    """
-    try:
-        payload = await _get(f"/api/blackdome/audit/{_path_segment(sigil_id)}")
-        return _dump(payload)
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            return json.dumps(
-                {"found": False, "sigil_id": sigil_id, "detail": "Sigil not found / invalid"},
-                indent=2,
-            )
-        return _format_error(exc, "verify_sigil")
-    except Exception as exc:
-        return _format_error(exc, "verify_sigil")
 
 
 @mcp.tool()
@@ -2182,7 +2261,7 @@ def main():
         print(
             "WARNING: BLACKDOME_API_KEY is not set. Free public tools "
             "(lookup_attacker_ip, top_attackers, attack_map, attack_heatmap, "
-            "credential_preview, verify_sigil, recent_iocs, ioc_trends, and "
+            "credential_preview, recent_iocs, ioc_trends, and "
             "json/csv export_iocs) will work, but paid tools "
             "(search_credentials, credential_stats, list_payloads, get_actor, "
             "explain_ioc, list_notable_sessions, get_session_transcript, "

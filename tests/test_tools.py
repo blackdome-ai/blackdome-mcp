@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _RELEASE_GATE_SCRIPT = _PACKAGE_ROOT / "scripts/check_release_artifact.py"
-_RELEASE_VERSION = "0.5.3"
+_RELEASE_VERSION = "0.5.4"
 _CANONICAL_SERVER_NAME = "io.github.blackdome-ai/blackdome-mcp"
 _RELEASE_TOOL_NAMES = (
     "lookup_attacker_ip",
@@ -41,7 +41,6 @@ _RELEASE_TOOL_NAMES = (
     "attack_map",
     "attack_heatmap",
     "credential_preview",
-    "verify_sigil",
     "recent_iocs",
     "ioc_trends",
     "export_iocs",
@@ -73,7 +72,6 @@ _README_TOOL_NAMES = (
     "attack_map",
     "attack_heatmap",
     "credential_preview",
-    "verify_sigil",
     "recent_iocs",
     "ioc_trends",
     "export_iocs",
@@ -166,12 +164,12 @@ def test_mcp_initialize_advertises_the_canonical_package_version():
     assert initialization.server_version == _RELEASE_VERSION
 
 
-def test_release_tool_contract_has_exactly_30_source_and_documented_tools():
-    """The immutable 0.5.3 release must not gain, lose, or rename a tool."""
+def test_release_tool_contract_has_exactly_29_source_and_documented_tools():
+    """The immutable 0.5.4 release must not gain, lose, or rename a tool."""
     assert _decorated_tool_names() == _RELEASE_TOOL_NAMES
     assert _readme_tool_names() == _README_TOOL_NAMES
     assert set(_README_TOOL_NAMES) == set(_RELEASE_TOOL_NAMES)
-    assert len(_RELEASE_TOOL_NAMES) == 30
+    assert len(_RELEASE_TOOL_NAMES) == 29
 
 
 def _run_release_artifact_gate(
@@ -374,19 +372,6 @@ async def test_whoami_path():
         await server.whoami()
 
     assert captured[0].url.path == "/api/v1/blackdome/me"
-
-
-@pytest.mark.asyncio
-async def test_verify_sigil_404_is_not_found_not_error():
-    def handler(request):
-        return json_response({"detail": "Sigil not found"}, status=404)
-
-    with mock_api(handler):
-        out = await server.verify_sigil("SIGIL-NOPE")
-
-    parsed = json.loads(out)
-    assert parsed["found"] is False
-    assert parsed["sigil_id"] == "SIGIL-NOPE"
 
 
 # ---------------------------------------------------------------------------

@@ -176,52 +176,67 @@ class ApiKeyCapture:
 
 
 class LimitHeaders:
-    """ASGI middleware: the caller's daily-limit headers from the BlackDome API on the HTTP answer to a tool call.
+    """ASGI middleware: the caller's allowance headers on every HTTP answer to a request that carries a key.
 
-    The tool's API calls leave the RateLimit-Limit, -Remaining, -Reset and -Policy values they were answered with in
-    a dict in this request's scope state (blackdome_mcp.server._record_limit). A streamed (SSE) answer would send its
-    headers before the tool has run, so for a POST the start of the answer is held back until its first body
-    chunk, then sent with those headers added. GET (the long-lived notification stream) and DELETE are passed
-    through untouched. An answer that already names a header keeps its own.
+    The daily headers (RateLimit-Limit, -Remaining, -Reset, -Policy) and the minute headers
+    (X-RateLimit-Minute-Limit, -Remaining, -Reset), as on every keyed answer of the REST API (walkthrough
+    2026-11-23, item 13). A tool's API calls leave the values they were answered with in a dict in this request's
+    scope state (blackdome_mcp.server._record_limit). A streamed (SSE) answer would send its headers before the
+    tool has run, so for a POST the start of the answer is held back until its first body chunk. An answer that
+    made no API call (initialize, the tool list, a notification, the GET event stream, DELETE) reuses the values
+    this key was answered with in the last few seconds, else reads its allowances from the API without spending
+    them (blackdome_mcp.server.allowance_headers). An answer that already names a header keeps its own. A request
+    without a key gets none.
     """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http" or scope.get("method") != "POST":
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+        key = _extract_key(scope)
         holder: dict = {}
         state = scope.setdefault("state", {})
         state[LIMIT_STATE_KEY] = holder
         held: list[dict] = []
+        hold_until_body = scope.get("method") == "POST"
 
-        def with_limit(start: dict) -> dict:
+        async def with_limit(start: dict) -> dict:
             info = holder.get("info")
-            if not info:
+            values = dict(info["headers"]) if info else {}
+            if key and values:
+                # A tool call's own answer: the freshest values, reused by this key's next answers that make no call.
+                _server.remember_allowances(key, values)
+            if key and not values:
+                values = await _server.allowance_headers(key, _header(scope, b"x-real-ip") or None)
+            if not values:
                 return start
             raw = list(start.get("headers") or [])
             present = {bytes(name).lower() for name, _ in raw}
-            for name, value in info["headers"].items():
-                key = name.lower().encode("latin-1")
-                if key not in present:
-                    raw.append((key, str(value).encode("latin-1")))
+            for name, value in values.items():
+                header = name.lower().encode("latin-1")
+                if header not in present:
+                    raw.append((header, str(value).encode("latin-1")))
             return {**start, "headers": raw}
 
         async def send_with_limit(message):
             if message.get("type") == "http.response.start":
-                held.append(message)
+                if hold_until_body:
+                    held.append(message)
+                    return
+                await send(await with_limit(message))
                 return
             if held and message.get("type") == "http.response.body":
-                await send(with_limit(held.pop()))
+                await send(await with_limit(held.pop()))
             await send(message)
 
         try:
             await self.app(scope, receive, send_with_limit)
         finally:
             if held:
-                await send(with_limit(held.pop()))
+                await send(await with_limit(held.pop()))
 
 
 def create_http_app():

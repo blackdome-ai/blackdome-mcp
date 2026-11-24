@@ -18,7 +18,6 @@ FREE_CALLS = [
     ("attack_map", {}),
     ("attack_heatmap", {}),
     ("credential_preview", {}),
-    ("verify_sigil", {"sigil_id": "SIGIL-EEEB0646"}),
     ("recent_iocs", {}),
     ("ioc_trends", {}),
 ]

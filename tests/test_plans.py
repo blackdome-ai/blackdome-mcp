@@ -46,7 +46,7 @@ def _tool_names():
 
 def test_every_tool_has_a_plan_in_the_table_and_nothing_else_is_in_it():
     names = set(_tool_names())
-    assert len(names) == 30
+    assert len(names) == 29
     assert "warboard" not in names
     in_table = {name.split(":")[0] for name in plans.TOOL_ACCESS}
     assert names == in_table
